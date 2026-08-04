@@ -512,8 +512,9 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 
+## BEFORE (Broken)
+```python
 async def main():
-    """Start the bot"""
     global telegram_app_ref
     
     print("\n" + "=" * 70)
@@ -573,12 +574,80 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
+    asyncio.run(main())
+```
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
+## AFTER (Fixed)
+```python
+def main():
+    global telegram_app_ref
+    
+    print("\n" + "=" * 70)
+    print("🚀 HLS → MP4 → YouTube Upload Bot (Production)")
+    print("=" * 70)
+    
     try:
-        loop.run_until_complete(main())
-    finally:
-        loop.close()
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            print("❌ FFmpeg not installed. Install with: sudo apt install ffmpeg")
+            return
+    except:
+        print("❌ FFmpeg not installed. Install with: sudo apt install ffmpeg")
+        return
+    
+    try:
+        result = subprocess.run(["ffprobe", "-version"], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            print("❌ ffprobe not installed. Install with: sudo apt install ffmpeg")
+            return
+    except:
+        print("❌ ffprobe not installed. Install with: sudo apt install ffmpeg")
+        return
+    
+    print("✅ FFmpeg available")
+    print(f"✅ Render External URL: {RENDER_EXTERNAL_URL}")
+    print(f"✅ OAuth Redirect URI: {OAUTH_REDIRECT_URI}")
+    print(f"✅ Token File: {TOKEN_FILE}")
+    
+    app = Application.builder().token(BOT_TOKEN).build()
+    telegram_app_ref = app
+    
+    print("\n🌐 Starting Flask OAuth callback server...")
+    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
+    flask_thread.start()
+    print("✅ Flask server started in background")
+    
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            WAITING_FOR_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url)],
+            CONFIRMING_UPLOAD: [MessageHandler(filters.Regex("^(✅ Upload to YouTube|❌ Cancel)$"), handle_upload_confirmation)],
+            GETTING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_title)],
+            GETTING_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_description)],
+            GETTING_VISIBILITY: [MessageHandler(filters.Regex("^(🌍 Public|👤 Private|🔗 Unlisted)$"), handle_visibility)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
+    )
+    
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("ytlogin", ytlogin))
+    app.add_handler(conv_handler)
+    app.add_error_handler(error_handler)
+    
+    print("\n" + "=" * 70)
+    print("🎯 Bot Started Successfully")
+    print("=" * 70)
+    print("\n📱 Telegram Commands:")
+    print("   /start    - Initialize bot")
+    print("   /ytlogin  - Authorize YouTube upload")
+    print("   /help     - Show help")
+    print("   /cancel   - Cancel operation")
+    print("\n" + "=" * 70 + "\n")
+    
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
+    
