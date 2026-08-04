@@ -294,26 +294,44 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def ytlogin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Initiate YouTube OAuth login"""
     global user_id_for_oauth, telegram_app_ref
+
     try:
         user_id_for_oauth = update.effective_user.id
+
         oauth = YouTubeOAuth(CLIENT_ID, CLIENT_SECRET)
+
         if oauth.is_authenticated():
-            await update.message.reply_text("✅ Already authenticated with YouTube!")
+            await update.message.reply_text(
+                "✅ Already authenticated with YouTube!"
+            )
             return ConversationHandler.END
+
         auth_url, state = oauth.get_authorization_url()
+
         message = (
-            "🔐 *YouTube Authorization*\n\n"
+            "<b>🔐 YouTube Authorization</b>\n\n"
             "Click the link below to grant permission:\n\n"
-            f"{auth_url}\n\n"
+            f'<a href="{auth_url}">Open Authorization Link</a>\n\n'
             "After granting permission, you'll be redirected and I'll send a confirmation."
         )
-        await update.message.reply_text(message, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+
+        await update.message.reply_text(
+            message,
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
         return ConversationHandler.END
+
     except Exception as e:
         logger.error(f"Error in ytlogin: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}", reply_markup=ReplyKeyboardRemove())
+
+        await update.message.reply_text(
+            f"❌ Error: {str(e)}",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
         return ConversationHandler.END
 
 
