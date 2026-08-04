@@ -512,8 +512,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 
-## BEFORE (Broken)
-```python
 async def main():
     global telegram_app_ref
     
