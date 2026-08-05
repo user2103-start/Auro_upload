@@ -68,7 +68,7 @@ class YouTubeOAuth:
                 self.credentials = None
 
     def _save_token_to_file(self):
-    """Save token to google_token.json"""
+        """Save token to google_token.json"""
     if not self.credentials:
         logger.error(f"_save_token_to_file: EARLY RETURN - self.credentials is None")
         return
