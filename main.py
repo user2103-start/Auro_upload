@@ -67,7 +67,7 @@ class YouTubeOAuth:
                 logger.warning(f"Failed to load token: {e}")
                 self.credentials = None
 
-         def _save_token_to_file(self):
+    def _save_token_to_file(self):
         """Save token to google_token.json"""
         if not self.credentials:
             logger.error("_save_token_to_file: EARLY RETURN - self.credentials is None")
@@ -82,15 +82,6 @@ class YouTubeOAuth:
         except Exception as e:
             logger.error(f"Failed to save token: {e}")
             logger.error(f"Failed to save token traceback: {traceback.format_exc()}")
-    
-    try:
-        with open(TOKEN_FILE, "w") as f:
-            f.write(self.credentials.to_json())
-        logger.info("✅ Token saved to google_token.json")
-    except Exception as e:
-        logger.error(f"Failed to save token: {e}")
-        logger.error(f"Failed to save token traceback: {traceback.format_exc()}")
-
 
 @flask_app.route("/oauth/callback", methods=["GET"])
 def oauth_callback():
