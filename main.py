@@ -370,7 +370,8 @@ async def handle_visibility(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return GETTING_VISIBILITY
     context.user_data["visibility"] = visibility_map[choice]
     await update.message.reply_text("🚀 Uploading to YouTube...", reply_markup=ReplyKeyboardRemove())
-    return await 
+    return await return await handle_youtube_upload(update, context)
+    
 async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Upload to YouTube with resumable upload and progress tracking"""
     max_retries = 3
