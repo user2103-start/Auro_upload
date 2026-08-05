@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Production-ready Telegram Bot: HLS → MP4 → YouTube Upload (Render optimized)"""
 
-import os, json, asyncio, logging, subprocess, tempfile, base64, threading
+import os, json, asyncio, logging, subprocess, tempfile, base64, threading, time
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Tuple
@@ -33,6 +33,9 @@ YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 TEMP_DIR = Path(tempfile.gettempdir()) / "telegram_hls_bot"
 TEMP_DIR.mkdir(exist_ok=True)
 
+PROCESS_START_TIME = time.time()
+PROCESS_PID = os.getpid()
+
 CURRENT_DIR = Path.cwd()
 TOKEN_FILE = CURRENT_DIR / "google_token.json"
 OAUTH_REDIRECT_URI = f"{RENDER_EXTERNAL_URL}/oauth/callback"
@@ -50,20 +53,34 @@ telegram_app_ref = None
 user_id_for_oauth = None
 
 
+def log_process_info(context: str):
+    """Log process and filesystem context"""
+    elapsed = time.time() - PROCESS_START_TIME
+    current_pid = os.getpid()
+    current_cwd = Path.cwd()
+    token_abs = TOKEN_FILE.resolve()
+    
+    logger.info(f"[DIAGNOSTIC:{context}] PID={current_pid} (started={PROCESS_PID}) elapsed={elapsed:.1f}s")
+    logger.info(f"[DIAGNOSTIC:{context}] cwd={current_cwd}")
+    logger.info(f"[DIAGNOSTIC:{context}] TOKEN_FILE={TOKEN_FILE}")
+    logger.info(f"[DIAGNOSTIC:{context}] TOKEN_FILE.resolve()={token_abs}")
+    logger.info(f"[DIAGNOSTIC:{context}] exists={TOKEN_FILE.exists()}")
+    if TOKEN_FILE.exists():
+        logger.info(f"[DIAGNOSTIC:{context}] size={TOKEN_FILE.stat().st_size}")
+        logger.info(f"[DIAGNOSTIC:{context}] mtime={datetime.fromtimestamp(TOKEN_FILE.stat().st_mtime)}")
+
+
 class YouTubeOAuth:
     def __init__(self, client_id: str, client_secret: str):
         self.client_id = client_id
         self.client_secret = client_secret
         self.credentials = None
-        current_cwd = Path.cwd()
-        logger.info(f"[INIT] YouTubeOAuth.__init__: cwd={current_cwd}, TOKEN_FILE={TOKEN_FILE}")
+        log_process_info("OAUTH_INIT")
         self._load_token_from_file()
 
     def _load_token_from_file(self):
         """Load token from google_token.json or environment variable (refresh_token backup)"""
-        current_cwd = Path.cwd()
-        logger.info(f"[LOAD] START: cwd={current_cwd}, TOKEN_FILE={TOKEN_FILE}")
-        logger.info(f"[LOAD] TOKEN_FILE.exists()={TOKEN_FILE.exists()}")
+        log_process_info("LOAD_START")
         
         if TOKEN_FILE.exists():
             try:
@@ -76,9 +93,13 @@ class YouTubeOAuth:
                 if self.credentials.expired and self.credentials.refresh_token:
                     logger.info(f"[LOAD] Token expired, attempting refresh")
                     self._refresh_token()
+                log_process_info("LOAD_FILE_SUCCESS")
                 return
             except Exception as e:
                 logger.error(f"[LOAD] Failed to load from file: {type(e).__name__}: {e}")
+        
+        logger.warning(f"[LOAD] FILE NOT FOUND: {TOKEN_FILE}")
+        log_process_info("LOAD_FILE_MISSING")
         
         refresh_token_env = os.getenv("YOUTUBE_REFRESH_TOKEN")
         if refresh_token_env:
@@ -96,15 +117,19 @@ class YouTubeOAuth:
                 if self.credentials.refresh_token:
                     self._refresh_token()
                     logger.info("✅ Restored and refreshed token from environment")
+                log_process_info("LOAD_ENV_SUCCESS")
                 return
             except Exception as e:
                 logger.error(f"[LOAD] Failed to restore from env: {type(e).__name__}: {e}")
         
         logger.warning(f"[LOAD] No token found: file={TOKEN_FILE.exists()}, env_var={bool(refresh_token_env)}")
+        log_process_info("LOAD_FAILED")
         self.credentials = None
 
     def _save_token_to_file(self):
         """Save token to google_token.json and environment"""
+        log_process_info("SAVE_START")
+        
         if not self.credentials:
             logger.error(f"[SAVE] ABORT: credentials is None")
             return
@@ -116,18 +141,24 @@ class YouTubeOAuth:
             with open(TOKEN_FILE, "w") as f:
                 bytes_written = f.write(token_json)
             
+            logger.info(f"[SAVE] Wrote {bytes_written} bytes")
+            
             verify_exists = TOKEN_FILE.exists()
             verify_size = TOKEN_FILE.stat().st_size if verify_exists else 0
-            logger.info(f"[SAVE] File: exists={verify_exists}, size={verify_size}")
+            verify_mtime = datetime.fromtimestamp(TOKEN_FILE.stat().st_mtime) if verify_exists else None
+            
+            logger.info(f"[SAVE] VERIFICATION: exists={verify_exists}, size={verify_size}, mtime={verify_mtime}")
             logger.info("✅ Token saved to google_token.json")
             
             if self.credentials.refresh_token:
                 os.environ["YOUTUBE_REFRESH_TOKEN"] = self.credentials.refresh_token
                 logger.info(f"[SAVE] Refresh token stored in YOUTUBE_REFRESH_TOKEN env var")
-                logger.info(f"[SAVE] Add to Render env vars for persistence:")
-                logger.info(f"[SAVE] YOUTUBE_REFRESH_TOKEN={self.credentials.refresh_token}")
+            
+            log_process_info("SAVE_SUCCESS")
         except Exception as e:
             logger.error(f"[SAVE] Failed: {type(e).__name__}: {e}")
+            logger.error(f"[SAVE] Traceback: {traceback.format_exc()}")
+            log_process_info("SAVE_FAILED")
 
     def _refresh_token(self):
         """Refresh access token using refresh token"""
@@ -171,6 +202,7 @@ class YouTubeOAuth:
     def handle_callback(self, code: str, state: str) -> bool:
         """Exchange authorization code for credentials"""
         try:
+            log_process_info("CALLBACK_START")
             logger.info(f"[CALLBACK] START")
             
             if state not in OAUTH_STATE_STORE:
@@ -191,9 +223,11 @@ class YouTubeOAuth:
             logger.info(f"[CALLBACK] Credentials obtained, saving...")
             self._save_token_to_file()
             logger.info("✅ Authorization successful")
+            log_process_info("CALLBACK_SUCCESS")
             return True
         except Exception as e:
             logger.error(f"[CALLBACK] Exception: {type(e).__name__}: {e}")
+            log_process_info("CALLBACK_FAILED")
             return False
 
     def is_authenticated(self) -> bool:
@@ -228,6 +262,7 @@ def oauth_callback():
     
     logger.info("=" * 70)
     logger.info("[OAUTH_CB] CALLBACK RECEIVED")
+    log_process_info("OAUTH_CB")
     logger.info("=" * 70)
     
     code = request.args.get("code")
@@ -247,12 +282,14 @@ def oauth_callback():
         
         if not success:
             logger.error(f"[OAUTH_CB] handle_callback failed")
+            log_process_info("OAUTH_CB_FAILED")
             logger.info("=" * 70)
             return "❌ Failed to obtain credentials", 400
         
         token_exists = TOKEN_FILE.exists()
         token_size = TOKEN_FILE.stat().st_size if token_exists else 0
         logger.info(f"[OAUTH_CB] After success: exists={token_exists}, size={token_size}")
+        log_process_info("OAUTH_CB_AFTER_SAVE")
         
         if telegram_app_ref and user_id_for_oauth:
             try:
@@ -270,6 +307,7 @@ def oauth_callback():
         return "✅ Authorization successful! Close this window.", 200
     except Exception as e:
         logger.error(f"[OAUTH_CB] Exception: {type(e).__name__}: {e}")
+        log_process_info("OAUTH_CB_EXCEPTION")
         logger.info("=" * 70)
         return f"❌ Server error: {str(e)}", 500
 
@@ -293,29 +331,20 @@ async def check_ffmpeg_installed() -> bool:
         return False
 
 
-async def check_ffprobe_installed() -> bool:
-    try:
-        result = await asyncio.to_thread(subprocess.run, ["ffprobe", "-version"], capture_output=True, timeout=5)
-        return result.returncode == 0
-    except:
-        return False
-
-
 async def download_hls_stream_to_mp4(url: str, output_path: str) -> bool:
     """Download HLS directly to MP4 without intermediate TS file - OPTIMIZED FOR SPEED"""
-    logger.info(f"[DOWNLOAD] Starting direct HLS→MP4 (no intermediate TS)")
+    logger.info(f"[DOWNLOAD] Starting direct HLS→MP4")
     cmd = [
         "ffmpeg",
         "-i", url,
-        "-c:v", "copy",      # Copy video codec - NO RE-ENCODING
-        "-c:a", "aac",       # Copy audio as AAC (compatible with MP4)
+        "-c:v", "copy",
+        "-c:a", "aac",
         "-bsf:a", "aac_adtstoasc",
-        "-movflags", "faststart",  # MP4 fast start
+        "-movflags", "faststart",
         "-y",
         output_path
     ]
     try:
-        logger.info(f"[DOWNLOAD] FFmpeg command: {' '.join(cmd)}")
         result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=3600)
         if result.returncode == 0:
             logger.info(f"[DOWNLOAD] SUCCESS")
@@ -329,11 +358,10 @@ async def download_hls_stream_to_mp4(url: str, output_path: str) -> bool:
 
 
 async def extract_metadata_fast(video_path: str) -> Dict[str, Any]:
-    """Fast metadata extraction - queries only duration and size"""
+    """Fast metadata extraction"""
     logger.info(f"[METADATA] Extracting (fast mode)")
     try:
         file_size_mb = round(Path(video_path).stat().st_size / (1024 * 1024), 2)
-        
         cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1:nokey=1", video_path]
         result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=10)
         
@@ -367,14 +395,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         "📖 *Help*\n\n"
         "*Commands:*\n"
-        "/start - Start the bot\n"
+        "/start - Start\n"
         "/ytlogin - Authorize YouTube\n"
-        "/cancel - Cancel\n\n"
-        "*Workflow:*\n"
-        "1. /ytlogin (first time only)\n"
-        "2. Send M3U8 URL\n"
-        "3. Wait for conversion\n"
-        "4. Upload to YouTube",
+        "/cancel - Cancel\n",
         parse_mode="Markdown"
     )
 
@@ -383,27 +406,31 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if "temp_dir" in context.user_data:
         import shutil
         try:
+            logger.info(f"[CLEANUP] Removing temp dir: {context.user_data['temp_dir']}")
             shutil.rmtree(context.user_data["temp_dir"])
-        except:
-            pass
+            logger.info(f"[CLEANUP] Temp dir removed")
+        except Exception as e:
+            logger.error(f"[CLEANUP] Failed to remove temp dir: {e}")
     context.user_data.clear()
     await update.message.reply_text("❌ Cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
 async def ytlogin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Authorize YouTube access - ENTERS CONVERSATION (FIX #1)"""
+    """Authorize YouTube access - ENTERS CONVERSATION"""
     global user_id_for_oauth, telegram_app_ref
 
     try:
+        log_process_info("YTLOGIN_START")
         logger.info(f"[YTLOGIN] START")
         user_id_for_oauth = update.effective_user.id
 
         oauth = YouTubeOAuth(CLIENT_ID, CLIENT_SECRET)
 
         if oauth.is_authenticated():
+            logger.info(f"[YTLOGIN] Already authenticated")
             await update.message.reply_text("✅ Already authenticated with YouTube!")
-            return WAITING_FOR_URL  # FIX: Enter conversation instead of ending it
+            return WAITING_FOR_URL
 
         auth_url, state = oauth.get_authorization_url()
 
@@ -414,10 +441,12 @@ async def ytlogin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
 
         await update.message.reply_text(message, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
-        return WAITING_FOR_URL  # FIX: Enter conversation to handle next URL message
+        log_process_info("YTLOGIN_AUTH_URL_SENT")
+        return WAITING_FOR_URL
 
     except Exception as e:
         logger.error(f"[YTLOGIN] Error: {type(e).__name__}: {e}")
+        log_process_info("YTLOGIN_FAILED")
         await update.message.reply_text(f"❌ Error: {str(e)}", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
@@ -428,6 +457,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("❌ Invalid URL.", reply_markup=ReplyKeyboardRemove())
         return WAITING_FOR_URL
     
+    log_process_info("HANDLE_URL_START")
     logger.info(f"[URL] Received: {url[:50]}...")
     context.user_data["url"] = url
     task_temp_dir = TEMP_DIR / f"task_{int(datetime.now().timestamp())}"
@@ -439,10 +469,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     success = await download_hls_stream_to_mp4(url, context.user_data["mp4_file"])
     if not success:
+        logger.error(f"[PROCESS] Download failed")
         await update.message.reply_text("❌ Download/conversion failed.", reply_markup=ReplyKeyboardRemove())
         return WAITING_FOR_URL
     
-    logger.info(f"[PROCESS] Conversion complete, extracting metadata")
+    logger.info(f"[PROCESS] Conversion complete")
     metadata = await extract_metadata_fast(context.user_data["mp4_file"])
     context.user_data["metadata"] = metadata
     
@@ -494,12 +525,13 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
     
     while retry_count < max_retries:
         try:
+            log_process_info("UPLOAD_START")
             logger.info(f"[UPLOAD] START")
             oauth = YouTubeOAuth(CLIENT_ID, CLIENT_SECRET)
             
             if not oauth.is_authenticated():
                 logger.error(f"[UPLOAD] NOT AUTHENTICATED")
-                logger.error(f"[UPLOAD] TOKEN_FILE={TOKEN_FILE.exists()}, ENV_REFRESH_TOKEN={bool(os.getenv('YOUTUBE_REFRESH_TOKEN'))}")
+                log_process_info("UPLOAD_NOT_AUTH")
                 await update.message.reply_text("❌ Not authenticated.\n\nUse /ytlogin first.", reply_markup=ReplyKeyboardRemove())
                 return ConversationHandler.END
             
@@ -551,9 +583,10 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
             
             import shutil
             try:
+                logger.info(f"[CLEANUP] Removing upload temp dir")
                 shutil.rmtree(context.user_data["temp_dir"])
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"[CLEANUP] Failed: {e}")
             
             context.user_data.clear()
             await update.message.reply_text(
@@ -561,6 +594,7 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
             logger.info(f"✅ Upload complete: {video_id}")
+            log_process_info("UPLOAD_SUCCESS")
             return WAITING_FOR_URL
         
         except HttpError as e:
@@ -576,6 +610,7 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
         
         except Exception as e:
             logger.error(f"[UPLOAD] Error: {type(e).__name__}: {e}")
+            log_process_info("UPLOAD_EXCEPTION")
             await update.message.reply_text(f"❌ Error: {str(e)}", reply_markup=ReplyKeyboardRemove())
             return ConversationHandler.END
     
@@ -594,14 +629,15 @@ def main():
     global telegram_app_ref
     
     logger.info("=" * 70)
-    logger.info(f"[STARTUP] cwd={Path.cwd()}, TOKEN_FILE={TOKEN_FILE}")
-    logger.info(f"[STARTUP] TOKEN_FILE exists={TOKEN_FILE.exists()}")
-    logger.info(f"[STARTUP] YOUTUBE_REFRESH_TOKEN={bool(os.getenv('YOUTUBE_REFRESH_TOKEN'))}")
+    logger.info("[STARTUP] HLS → MP4 → YouTube Bot")
+    log_process_info("STARTUP")
     logger.info("=" * 70)
     
     print("\n" + "=" * 70)
     print("🚀 HLS → MP4 → YouTube Bot (Render Optimized)")
     print("=" * 70)
+    print(f"Process ID: {PROCESS_PID}")
+    print(f"Start time: {datetime.fromtimestamp(PROCESS_START_TIME)}")
     
     try:
         result = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
@@ -649,3 +685,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                            
