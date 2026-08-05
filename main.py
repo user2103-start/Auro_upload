@@ -394,6 +394,7 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
             logger.info(f"handle_youtube_upload: Building YouTube service")
             youtube = oauth.get_youtube_service()
             logger.info(f"handle_youtube_upload: YouTube service ready")
+            last_update = 0
             def upload_with_progress():
                 """Perform resumable upload with progress tracking"""
                 nonlocal last_update
