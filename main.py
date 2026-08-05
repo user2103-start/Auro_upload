@@ -67,74 +67,19 @@ class YouTubeOAuth:
                 logger.warning(f"Failed to load token: {e}")
                 self.credentials = None
 
-    def _save_token_to_file(self):
-        """Save token to google_token.json"""
-        if not self.credentials:
-            return
-        try:
-            with open(TOKEN_FILE, "w") as f:
-                f.write(self.credentials.to_json())
-            logger.info("✅ Token saved to google_token.json")
-        except Exception as e:
-            logger.error(f"Failed to save token: {e}")
-
-    def _refresh_token(self):
-        """Refresh access token using refresh token"""
-        if not self.credentials or not self.credentials.refresh_token:
-            return False
-        try:
-            self.credentials.refresh(Request())
-            self._save_token_to_file()
-            logger.info("🔄 Access token refreshed")
-            return True
-        except RefreshError as e:
-            logger.error(f"Failed to refresh token: {e}")
-            self.credentials = None
-            return False
-
-    def get_authorization_url(self) -> Tuple[str, str]:
-        """Generate authorization URL and state for OAuth callback"""
-        flow = Flow.from_client_config({
-            "installed": {
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-            }
-        }, scopes=YOUTUBE_SCOPES, redirect_uri=OAUTH_REDIRECT_URI)
-        auth_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
-        OAUTH_STATE_STORE[state] = flow
-        return auth_url, state
-
-    def handle_callback(self, code: str, state: str) -> bool:
-        """Exchange authorization code for credentials"""
-        try:
-            if state not in OAUTH_STATE_STORE:
-                logger.error(f"Invalid OAuth state: {state}")
-                return False
-            flow = OAUTH_STATE_STORE.pop(state)
-            flow.fetch_token(code=code)
-            self.credentials = flow.credentials
-            self._save_token_to_file()
-            logger.info("✅ Authorization successful")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to handle OAuth callback: {e}")
-            return False
-
-    def is_authenticated(self) -> bool:
-        """Check if authenticated and refresh if needed"""
-        if not self.credentials:
-            return False
-        if self.credentials.expired and self.credentials.refresh_token:
-            return self._refresh_token()
-        return True
-
-    def get_youtube_service(self):
-        """Get authenticated YouTube service"""
-        if not self.is_authenticated():
-            raise RuntimeError("❌ Not authenticated. Use /ytlogin first.")
-        return build("youtube", "v3", credentials=self.credentials)
+def _save_token_to_file(self):
+    """Save token to google_token.json"""
+    if not self.credentials:
+        logger.error(f"_save_token_to_file: EARLY RETURN - self.credentials is None")
+        return
+    
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            f.write(self.credentials.to_json())
+        logger.info("✅ Token saved to google_token.json")
+    except Exception as e:
+        logger.error(f"Failed to save token: {e}")
+        logger.error(f"Failed to save token traceback: {traceback.format_exc()}")
 
 
 @flask_app.route("/oauth/callback", methods=["GET"])
@@ -436,27 +381,20 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
     
     while retry_count < max_retries:
         try:
+            logger.info(f"handle_youtube_upload: Creating YouTubeOAuth instance")
             oauth = YouTubeOAuth(CLIENT_ID, CLIENT_SECRET)
+            
+            logger.info(f"handle_youtube_upload: Checking is_authenticated()")
             if not oauth.is_authenticated():
+                logger.error(f"handle_youtube_upload: NOT AUTHENTICATED - credentials is None")
+                logger.error(f"handle_youtube_upload: TOKEN_FILE exists: {TOKEN_FILE.exists()}")
+                logger.error(f"handle_youtube_upload: You must run /ytlogin first and see '✅ Token saved to google_token.json' in logs")
                 await update.message.reply_text("❌ Not authenticated with YouTube.\n\nUse /ytlogin to authorize first.", reply_markup=ReplyKeyboardRemove())
                 return ConversationHandler.END
             
+            logger.info(f"handle_youtube_upload: Building YouTube service")
             youtube = oauth.get_youtube_service()
-            video_body = {
-                "snippet": {
-                    "title": context.user_data["title"],
-                    "description": context.user_data["description"],
-                },
-                "status": {"privacyStatus": context.user_data["visibility"]}
-            }
-            
-            mp4_file = context.user_data["mp4_file"]
-            media = MediaFileUpload(mp4_file, mimetype="video/mp4", resumable=True, chunksize=10 * 1024 * 1024)
-            request = youtube.videos().insert(part="snippet,status", body=video_body, media_body=media)
-            
-            progress_msg = await update.message.reply_text("📤 Starting upload... 0%")
-            last_update = 0
-            
+            logger.info(f"handle_youtube_upload: YouTube service ready")
             def upload_with_progress():
                 """Perform resumable upload with progress tracking"""
                 nonlocal last_update
