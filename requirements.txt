@@ -1,6 +1,6 @@
-python-telegram-bot>=22.0
-google-auth-oauthlib>=1.2.0
-google-auth-httplib2>=0.2.0
-google-api-python-client>=2.100.0
-Flask>=3.0.0
-gunicorn>=21.0.0
+python-telegram-bot==21.6
+google-api-python-client==2.147.0
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+imageio-ffmpeg==0.5.1
+aiohttp==3.10.10
