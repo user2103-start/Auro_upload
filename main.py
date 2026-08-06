@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Production-ready Telegram Bot: HLS → MP4 → YouTube Upload (Render optimized)
-FINAL COMPLETE FIX: fsync after file write, env var backup, no race conditions."""
+"""Production-ready Telegram Bot: HLS → MP4 → YouTube Upload
+Designed for Render + Gunicorn (production WSGI server)"""
 
 import os, json, asyncio, logging, subprocess, tempfile, base64, threading, time, sys
 from pathlib import Path
@@ -45,9 +45,7 @@ TEMP_DIR.mkdir(exist_ok=True)
 PROCESS_START_TIME = time.time()
 PROCESS_PID = os.getpid()
 
-# Use /tmp for token (more reliable on Render than project dir)
 TOKEN_FILE = Path(tempfile.gettempdir()) / "google_token.json"
-
 OAUTH_STATE_DIR = TEMP_DIR / "oauth_states"
 OAUTH_STATE_DIR.mkdir(exist_ok=True)
 
@@ -67,100 +65,71 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global token cache - fallback if file not readable
-_TOKEN_CACHE = None
-_TOKEN_CACHE_TIME = 0
-
+# ==================== FLASK APP ====================
 flask_app = Flask(__name__)
 flask_app.secret_key = secrets.token_hex(32)
+
 telegram_app_ref = None
 user_id_for_oauth = None
 
+_TOKEN_CACHE = None
+_TOKEN_CACHE_TIME = 0
+
 
 def save_token_to_cache(token_json: str):
-    """Store token in global cache as backup."""
     global _TOKEN_CACHE, _TOKEN_CACHE_TIME
     _TOKEN_CACHE = token_json
     _TOKEN_CACHE_TIME = time.time()
-    logger.info(f"[CACHE] Token stored in memory (TTL: 1 hour)")
 
 
 def get_token_from_cache() -> Optional[str]:
-    """Get token from cache if fresh (< 1 hour old)."""
     global _TOKEN_CACHE, _TOKEN_CACHE_TIME
     if _TOKEN_CACHE and (time.time() - _TOKEN_CACHE_TIME) < 3600:
-        logger.info(f"[CACHE] Token retrieved from memory (age: {time.time() - _TOKEN_CACHE_TIME:.0f}s)")
         return _TOKEN_CACHE
     return None
 
 
 def log_process_info(context: str):
-    """Log process and filesystem context"""
     elapsed = time.time() - PROCESS_START_TIME
-    current_pid = os.getpid()
-    
-    logger.info(f"[DIAGNOSTIC:{context}] PID={current_pid} (started={PROCESS_PID}) elapsed={elapsed:.1f}s")
-    logger.info(f"[DIAGNOSTIC:{context}] TOKEN_FILE={TOKEN_FILE}, exists={TOKEN_FILE.exists()}")
-    if TOKEN_FILE.exists():
-        logger.info(f"[DIAGNOSTIC:{context}] TOKEN_FILE.size={TOKEN_FILE.stat().st_size} bytes")
+    logger.info(f"[{context}] elapsed={elapsed:.1f}s, PID={os.getpid()}, TOKEN_FILE exists={TOKEN_FILE.exists()}")
 
 
 def cleanup_expired_oauth_states():
-    """Clean up old state files."""
     now = time.time()
     try:
         for state_file in OAUTH_STATE_DIR.glob('*.txt'):
-            file_age = now - state_file.stat().st_mtime
-            if file_age > OAUTH_STATE_TTL:
-                try:
-                    state_file.unlink()
-                except:
-                    pass
+            if (now - state_file.stat().st_mtime) > OAUTH_STATE_TTL:
+                state_file.unlink()
     except:
         pass
 
 
 def validate_oauth_state(state: str) -> bool:
-    """Validate and consume state."""
     state_file = OAUTH_STATE_DIR / f"{state}.txt"
-    
     if not state_file.exists():
-        logger.warning(f"[OAUTH_STATE] State file not found: {state[:20]}...")
         return False
-    
-    file_age = time.time() - state_file.stat().st_mtime
-    if file_age > OAUTH_STATE_TTL:
-        logger.warning(f"[OAUTH_STATE] State expired: {file_age:.0f}s")
+    if (time.time() - state_file.stat().st_mtime) > OAUTH_STATE_TTL:
         try:
             state_file.unlink()
         except:
             pass
         return False
-    
     try:
         state_file.unlink()
-        logger.info(f"[OAUTH_STATE] State validated and consumed: {state[:20]}...")
         return True
-    except Exception as e:
-        logger.error(f"[OAUTH_STATE] Failed to consume: {e}")
+    except:
         return False
 
 
 def create_oauth_flow() -> Flow:
-    """Create OAuth Flow."""
-    try:
-        flow = Flow.from_client_config({
-            "installed": {
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-            }
-        }, scopes=YOUTUBE_SCOPES, redirect_uri=OAUTH_REDIRECT_URI)
-        return flow
-    except Exception as e:
-        logger.error(f"[OAUTH_FLOW] Failed: {type(e).__name__}: {e}")
-        raise
+    return Flow.from_client_config({
+        "installed": {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }, scopes=YOUTUBE_SCOPES, redirect_uri=OAUTH_REDIRECT_URI)
 
 
 class YouTubeOAuth:
@@ -168,58 +137,36 @@ class YouTubeOAuth:
         self.client_id = client_id
         self.client_secret = client_secret
         self.credentials = None
-        log_process_info("OAUTH_INIT")
         self._load_token_from_file()
 
     def _load_token_from_file(self):
-        """Load token from file or cache or env var."""
-        log_process_info("LOAD_START")
-        logger.info(f"[LOAD] Attempting to load from: {TOKEN_FILE}")
+        logger.info(f"[LOAD] Attempting from: {TOKEN_FILE}")
         
-        # TRY #1: Load from file
         if TOKEN_FILE.exists():
             try:
-                file_size = TOKEN_FILE.stat().st_size
-                logger.info(f"[LOAD] File exists, size={file_size} bytes")
                 with open(TOKEN_FILE, "r") as f:
                     token_json = f.read()
                 self.credentials = Credentials.from_authorized_user_info(json.loads(token_json), YOUTUBE_SCOPES)
-                logger.info("✅ Loaded token from FILE")
-                logger.info(f"[LOAD] credentials.valid={self.credentials.valid}, expired={self.credentials.expired}, has_refresh_token={bool(self.credentials.refresh_token)}")
-                
+                logger.info("✅ Loaded from FILE")
                 if self.credentials.expired and self.credentials.refresh_token:
                     self._refresh_token()
-                
-                log_process_info("LOAD_FILE_SUCCESS")
                 return
             except Exception as e:
-                logger.error(f"[LOAD] Failed to load from file: {type(e).__name__}: {e}")
+                logger.error(f"[LOAD] File failed: {e}")
         
-        logger.warning(f"[LOAD] File not found or unreadable: {TOKEN_FILE}")
-        
-        # TRY #2: Load from memory cache
         cache_json = get_token_from_cache()
         if cache_json:
             try:
-                logger.info(f"[LOAD] Attempting to load from MEMORY CACHE")
                 self.credentials = Credentials.from_authorized_user_info(json.loads(cache_json), YOUTUBE_SCOPES)
-                logger.info("✅ Loaded token from CACHE")
-                logger.info(f"[LOAD] credentials.valid={self.credentials.valid}, expired={self.credentials.expired}, has_refresh_token={bool(self.credentials.refresh_token)}")
-                
+                logger.info("✅ Loaded from CACHE")
                 if self.credentials.expired and self.credentials.refresh_token:
                     self._refresh_token()
-                
-                log_process_info("LOAD_CACHE_SUCCESS")
                 return
             except Exception as e:
-                logger.error(f"[LOAD] Failed to load from cache: {type(e).__name__}: {e}")
+                logger.error(f"[LOAD] Cache failed: {e}")
         
-        logger.warning(f"[LOAD] Cache not available")
-        
-        # TRY #3: Load from environment variable
         refresh_token_env = os.getenv("YOUTUBE_REFRESH_TOKEN")
         if refresh_token_env:
-            logger.info(f"[LOAD] Attempting to restore from YOUTUBE_REFRESH_TOKEN env var")
             try:
                 self.credentials = Credentials(
                     token=None,
@@ -229,100 +176,62 @@ class YouTubeOAuth:
                     client_secret=self.client_secret,
                     scopes=YOUTUBE_SCOPES
                 )
-                logger.info(f"[LOAD] Created credentials from env refresh_token")
-                
+                logger.info("✅ Loaded from ENV VAR")
                 if self.credentials.refresh_token:
                     self._refresh_token()
-                    logger.info("✅ Loaded token from ENV VAR")
-                
-                log_process_info("LOAD_ENV_SUCCESS")
                 return
             except Exception as e:
-                logger.error(f"[LOAD] Failed to load from env: {type(e).__name__}: {e}")
+                logger.error(f"[LOAD] Env failed: {e}")
         
-        logger.error(f"[LOAD] ❌ NO TOKEN FOUND ANYWHERE (file, cache, or env)")
-        log_process_info("LOAD_FAILED")
+        logger.error("[LOAD] ❌ NO TOKEN FOUND")
         self.credentials = None
 
     def _save_token_to_file(self):
-        """Save token to file, cache, and env var with fsync."""
-        log_process_info("SAVE_START")
-        logger.info(f"[SAVE] Target file: {TOKEN_FILE}")
-        
-        if not self.credentials:
-            logger.error(f"[SAVE] ABORT: credentials is None")
+        if not self.credentials or not self.credentials.token:
+            logger.error("[SAVE] No credentials to save")
             return
         
         try:
-            if not self.credentials.token:
-                logger.error(f"[SAVE] ABORT: credentials.token is empty")
-                return
-            
             token_json = self.credentials.to_json()
-            
-            # SAVE #1: Write to file with fsync
-            logger.info(f"[SAVE] Writing to file with fsync...")
             TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
             
             with open(TOKEN_FILE, "w") as f:
                 f.write(token_json)
                 f.flush()
-                os.fsync(f.fileno())  # ← CRITICAL FIX: Force disk sync
+                os.fsync(f.fileno())  # Force disk sync
             
-            logger.info(f"[SAVE] File synced to disk")
-            
-            # Verify file was created
-            if not TOKEN_FILE.exists():
-                logger.error(f"[SAVE] ❌ File not found after write!")
-                return
-            
-            verify_size = TOKEN_FILE.stat().st_size
-            logger.info(f"[SAVE] ✅ File verified: {verify_size} bytes on disk")
-            
-            # SAVE #2: Store in memory cache
+            logger.info(f"✅ Saved to FILE ({TOKEN_FILE.stat().st_size} bytes)")
             save_token_to_cache(token_json)
             
-            # SAVE #3: Store refresh_token in env var
             if self.credentials.refresh_token:
                 os.environ["YOUTUBE_REFRESH_TOKEN"] = self.credentials.refresh_token
-                logger.info(f"[SAVE] ✅ Refresh token in env var")
+                logger.info("✅ Refresh token in env var")
             else:
-                logger.warning(f"[SAVE] ⚠️ NO REFRESH_TOKEN (will need re-auth in ~1 hour)")
-            
-            logger.info("✅ Token saved to FILE + CACHE + ENV")
-            log_process_info("SAVE_SUCCESS")
+                logger.warning("⚠️ NO REFRESH_TOKEN (1 hour expiry)")
         except Exception as e:
-            logger.error(f"[SAVE] Failed: {type(e).__name__}: {e}")
-            log_process_info("SAVE_FAILED")
+            logger.error(f"[SAVE] Failed: {e}")
 
     def _refresh_token(self):
-        """Refresh access token."""
         if not self.credentials or not self.credentials.refresh_token:
             return False
-        
         try:
-            logger.info(f"[REFRESH] Refreshing token...")
             self.credentials.refresh(Request())
-            logger.info(f"[REFRESH] ✅ Success")
+            logger.info("[REFRESH] ✅ Token refreshed")
             self._save_token_to_file()
             return True
         except Exception as e:
-            logger.error(f"[REFRESH] Failed: {type(e).__name__}: {e}")
+            logger.error(f"[REFRESH] Failed: {e}")
             self.credentials = None
             return False
 
     def get_authorization_url(self) -> Tuple[str, str]:
-        """Generate auth URL."""
         try:
-            logger.info(f"[OAUTH] Generating URL with redirect_uri: {OAUTH_REDIRECT_URI}")
             flow = create_oauth_flow()
             auth_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
             
-            # Store state
             state_file = OAUTH_STATE_DIR / f"{state}.txt"
             state_file.touch()
             
-            # Store PKCE verifier
             if hasattr(flow, 'code_verifier') and flow.code_verifier:
                 verifier_file = OAUTH_STATE_DIR / f"{state}_verifier.txt"
                 verifier_file.write_text(flow.code_verifier)
@@ -330,23 +239,19 @@ class YouTubeOAuth:
             logger.info(f"[OAUTH] ✅ URL generated, state={state[:20]}...")
             return auth_url, state
         except Exception as e:
-            logger.error(f"[OAUTH] Failed: {type(e).__name__}: {e}")
+            logger.error(f"[OAUTH] Failed: {e}")
             raise
 
     def handle_callback(self, code: str, state: str) -> bool:
-        """Exchange code for credentials."""
         try:
-            log_process_info("CALLBACK_START")
             logger.info(f"[CALLBACK] START: state={state[:20]}...")
             
             if not validate_oauth_state(state):
-                logger.error(f"[CALLBACK] Invalid state")
+                logger.error("[CALLBACK] Invalid state")
                 return False
             
-            logger.info(f"[CALLBACK] State valid, exchanging code...")
             flow = create_oauth_flow()
             
-            # Restore PKCE verifier if present
             verifier_file = OAUTH_STATE_DIR / f"{state}_verifier.txt"
             if verifier_file.exists():
                 try:
@@ -361,67 +266,47 @@ class YouTubeOAuth:
             self.credentials = flow.credentials
             
             if not self.credentials or not self.credentials.token:
-                logger.error(f"[CALLBACK] No credentials returned")
+                logger.error("[CALLBACK] No credentials")
                 return False
             
-            logger.info(f"[CALLBACK] ✅ Credentials obtained, saving...")
-            logger.info(f"[CALLBACK] credentials.valid={self.credentials.valid}, expired={self.credentials.expired}, refresh_token={bool(self.credentials.refresh_token)}")
-            
+            logger.info(f"[CALLBACK] ✅ Credentials obtained")
             self._save_token_to_file()
             logger.info("✅ Authorization SUCCESS")
-            log_process_info("CALLBACK_SUCCESS")
             return True
         except Exception as e:
             logger.error(f"[CALLBACK] Failed: {type(e).__name__}: {e}")
-            log_process_info("CALLBACK_FAILED")
             return False
 
     def is_authenticated(self) -> bool:
-        """Check if credentials are valid."""
         if not self.credentials:
             logger.warning("[AUTH] No credentials")
             return False
         
-        logger.info(f"[AUTH] Checking: valid={self.credentials.valid}, expired={self.credentials.expired}, refresh_token={bool(self.credentials.refresh_token)}")
-        
         if self.credentials.expired:
-            logger.warning(f"[AUTH] Token expired")
             if self.credentials.refresh_token:
-                logger.info(f"[AUTH] Refreshing...")
                 return self._refresh_token()
             else:
-                logger.error(f"[AUTH] ❌ Expired + no refresh_token")
+                logger.error("[AUTH] ❌ Expired + no refresh_token")
                 return False
         
         if not self.credentials.valid:
-            logger.warning(f"[AUTH] Token not valid")
             if self.credentials.refresh_token:
                 return self._refresh_token()
             else:
-                logger.error(f"[AUTH] ❌ Not valid + no refresh_token")
+                logger.error("[AUTH] ❌ Not valid + no refresh_token")
                 return False
         
-        logger.info(f"[AUTH] ✅ Authenticated")
+        logger.info("[AUTH] ✅ Valid")
         return True
 
     def get_youtube_service(self):
-        """Get YouTube service."""
         if not self.is_authenticated():
-            logger.error(f"[SERVICE] Not authenticated")
             raise RuntimeError("❌ Not authenticated. Use /ytlogin first.")
-        
-        try:
-            service = build("youtube", "v3", credentials=self.credentials)
-            logger.info(f"[SERVICE] ✅ Service ready")
-            return service
-        except Exception as e:
-            logger.error(f"[SERVICE] Failed: {type(e).__name__}: {e}")
-            raise
+        return build("youtube", "v3", credentials=self.credentials)
 
 
 @flask_app.route("/oauth/callback", methods=["GET"])
 def oauth_callback():
-    """OAuth callback."""
     global user_id_for_oauth, telegram_app_ref
     
     logger.info("=" * 80)
@@ -436,11 +321,11 @@ def oauth_callback():
     logger.info(f"[OAUTH_CB] state={state[:20] if state else 'None'}...")
     
     if error:
-        logger.error(f"[OAUTH_CB] Google error: {error}")
+        logger.error(f"[OAUTH_CB] Error: {error}")
         return f"❌ {error}", 400
     
     if not code or not state:
-        logger.error(f"[OAUTH_CB] Missing code or state")
+        logger.error("[OAUTH_CB] Missing code or state")
         return "❌ Missing code or state", 400
     
     try:
@@ -448,12 +333,10 @@ def oauth_callback():
         success = oauth.handle_callback(code, state)
         
         if not success:
-            logger.error(f"[OAUTH_CB] handle_callback failed")
-            return "❌ Failed to obtain credentials", 400
+            logger.error("[OAUTH_CB] Failed")
+            return "❌ Failed", 400
         
-        logger.info(f"[OAUTH_CB] File exists: {TOKEN_FILE.exists()}, size: {TOKEN_FILE.stat().st_size if TOKEN_FILE.exists() else 0}")
-        logger.info(f"[OAUTH_CB] Cache valid: {_TOKEN_CACHE is not None}")
-        logger.info(f"[OAUTH_CB] Env var set: {bool(os.getenv('YOUTUBE_REFRESH_TOKEN'))}")
+        logger.info(f"[OAUTH_CB] TOKEN_FILE: exists={TOKEN_FILE.exists()}, size={TOKEN_FILE.stat().st_size if TOKEN_FILE.exists() else 0}")
         
         if telegram_app_ref and user_id_for_oauth:
             try:
@@ -464,6 +347,7 @@ def oauth_callback():
                     text="✅ *YouTube authentication successful!*",
                     parse_mode="Markdown"
                 ))
+                logger.info("[OAUTH_CB] ✅ Telegram notified")
             except Exception as e:
                 logger.error(f"[OAUTH_CB] Telegram failed: {e}")
         
@@ -471,6 +355,7 @@ def oauth_callback():
         return "✅ Authorization successful! Close this window.", 200
     except Exception as e:
         logger.error(f"[OAUTH_CB] Exception: {type(e).__name__}: {e}")
+        logger.error(traceback.format_exc())
         return f"❌ Server error", 500
 
 
@@ -479,14 +364,10 @@ def health():
     return {"status": "ok"}, 200
 
 
-def run_flask_app():
-    logger.info(f"🌐 Flask starting on port {PORT}")
-    logger.info(f"🌐 REDIRECT_URI: {OAUTH_REDIRECT_URI}")
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
-
+# ==================== TELEGRAM HANDLERS ====================
 
 async def download_hls_stream_to_mp4(url: str, output_path: str) -> bool:
-    logger.info(f"[DOWNLOAD] HLS→MP4 starting")
+    logger.info(f"[DOWNLOAD] Starting")
     cmd = [
         "ffmpeg", "-i", url,
         "-c:v", "copy", "-c:a", "aac", "-bsf:a", "aac_adtstoasc", "-movflags", "faststart",
@@ -498,10 +379,10 @@ async def download_hls_stream_to_mp4(url: str, output_path: str) -> bool:
             logger.info(f"[DOWNLOAD] ✅ Success")
             return True
         else:
-            logger.error(f"[DOWNLOAD] FFmpeg failed")
+            logger.error(f"[DOWNLOAD] FFmpeg error")
             return False
     except Exception as e:
-        logger.error(f"[DOWNLOAD] Error: {e}")
+        logger.error(f"[DOWNLOAD] Exception: {e}")
         return False
 
 
@@ -551,7 +432,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def ytlogin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     global user_id_for_oauth
     try:
-        logger.info(f"[YTLOGIN] START")
+        logger.info("[YTLOGIN] START")
         user_id_for_oauth = update.effective_user.id
         oauth = YouTubeOAuth(CLIENT_ID, CLIENT_SECRET)
         
@@ -633,7 +514,6 @@ async def handle_visibility(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Upload to YouTube"""
     max_retries = 3
     retry_count = 0
     
@@ -642,13 +522,12 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
             logger.info(f"[UPLOAD] START (attempt {retry_count + 1}/{max_retries})")
             oauth = YouTubeOAuth(CLIENT_ID, CLIENT_SECRET)
             
-            logger.info(f"[UPLOAD] Checking auth...")
             if not oauth.is_authenticated():
-                logger.error(f"[UPLOAD] NOT authenticated")
+                logger.error("[UPLOAD] NOT authenticated")
                 await update.message.reply_text("❌ Not authenticated.\n\nUse /ytlogin first.", reply_markup=ReplyKeyboardRemove())
                 return ConversationHandler.END
             
-            logger.info(f"[UPLOAD] Building YouTube service...")
+            logger.info("[UPLOAD] Building YouTube service...")
             youtube = oauth.get_youtube_service()
             
             video_body = {
@@ -716,7 +595,7 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
             return ConversationHandler.END
         
         except Exception as e:
-            logger.error(f"[UPLOAD] Error: {type(e).__name__}: {e}")
+            logger.error(f"[UPLOAD] Exception: {type(e).__name__}: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}", reply_markup=ReplyKeyboardRemove())
             return ConversationHandler.END
     
@@ -725,47 +604,14 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Error: {context.error}")
-    try:
-        await update.message.reply_text("❌ An error occurred.", reply_markup=ReplyKeyboardRemove())
-    except:
-        pass
 
 
-def main():
+def run_telegram_polling():
+    """Run Telegram polling in background thread"""
     global telegram_app_ref
-    
-    print("\n" + "=" * 80)
-    print("[STARTUP] 🚀 HLS → MP4 → YouTube Bot (PRODUCTION READY)")
-    print("=" * 80)
-    print(f"TOKEN_FILE: {TOKEN_FILE}")
-    print(f"REDIRECT_URI: {OAUTH_REDIRECT_URI}")
-    print("=" * 80 + "\n")
-    
-    logger.info("=" * 80)
-    logger.info("[STARTUP] HLS → MP4 → YouTube Bot")
-    logger.info(f"TOKEN_FILE: {TOKEN_FILE}")
-    logger.info(f"REDIRECT_URI: {OAUTH_REDIRECT_URI}")
-    logger.info("=" * 80)
-    
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5, check=True)
-        print("✅ FFmpeg ready")
-    except:
-        print("❌ FFmpeg not found")
-        return
     
     app = Application.builder().token(BOT_TOKEN).build()
     telegram_app_ref = app
-    
-    print("🌐 Starting Flask...")
-    threading.Thread(target=run_flask_app, daemon=True).start()
-    
-    print("🧹 Starting cleanup...")
-    def cleanup():
-        while True:
-            time.sleep(300)
-            cleanup_expired_oauth_states()
-    threading.Thread(target=cleanup, daemon=True).start()
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start), CommandHandler("ytlogin", ytlogin)],
@@ -784,9 +630,70 @@ def main():
     app.add_handler(conv_handler)
     app.add_error_handler(error_handler)
     
-    print("✅ Bot Ready\n")
+    logger.info("🤖 Telegram polling started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+def run_cleanup():
+    """Cleanup daemon"""
+    while True:
+        time.sleep(300)
+        cleanup_expired_oauth_states()
+
+
+def main():
+    """Entry point for gunicorn"""
+    print("\n" + "=" * 80)
+    print("[STARTUP] 🚀 HLS → MP4 → YouTube Bot (Production with Gunicorn)")
+    print("=" * 80)
+    print(f"BOT_TOKEN: {BOT_TOKEN[:20]}..." if BOT_TOKEN else "❌ Missing")
+    print(f"RENDER_EXTERNAL_URL: {RENDER_EXTERNAL_URL}")
+    print(f"OAUTH_REDIRECT_URI: {OAUTH_REDIRECT_URI}")
+    print(f"TOKEN_FILE: {TOKEN_FILE}")
+    print(f"PORT: {PORT}")
+    print("=" * 80 + "\n")
+    
+    logger.info("=" * 80)
+    logger.info("[STARTUP] HLS → MP4 → YouTube Bot (Gunicorn Production)")
+    logger.info(f"RENDER_EXTERNAL_URL: {RENDER_EXTERNAL_URL}")
+    logger.info(f"OAUTH_REDIRECT_URI: {OAUTH_REDIRECT_URI}")
+    logger.info(f"TOKEN_FILE: {TOKEN_FILE}")
+    logger.info(f"PORT: {PORT}")
+    logger.info("=" * 80)
+    
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5, check=True)
+        print("✅ FFmpeg ready")
+    except:
+        print("❌ FFmpeg not found")
+        return
+    
+    print("🧹 Starting cleanup daemon...")
+    threading.Thread(target=run_cleanup, daemon=True).start()
+    
+    print("🤖 Starting Telegram polling daemon...")
+    threading.Thread(target=run_telegram_polling, daemon=True).start()
+    
+    print("✅ Bot Ready - Waiting for Gunicorn\n")
+    
+    # Return Flask app for gunicorn to run
+    return flask_app
+
+
+# ==================== GUNICORN ENTRY POINT ====================
 if __name__ == "__main__":
-    main()
+    app = main()
+    # For local testing only:
+    if os.getenv("FLASK_ENV") == "development":
+        logger.warning("⚠️ WARNING: Running in DEVELOPMENT mode!")
+        app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+else:
+    # Gunicorn will call this
+    app = main()
+PRODEOF
+python3 -m py_compile /mnt/user-data/outputs/main.py && echo "✅ Syntax OK" && wc -l /mnt/user-data/outputs/main.py
+Output
+
+✅ Syntax OK
+692 /mnt/user-data/outputs/main.py
+        
