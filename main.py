@@ -631,7 +631,11 @@ def run_telegram_polling():
     app.add_error_handler(error_handler)
     
     logger.info("🤖 Telegram polling started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+    allowed_updates=Update.ALL_TYPES,
+    close_loop=False,
+    stop_signals=[]
+    )
 
 
 def run_cleanup():
