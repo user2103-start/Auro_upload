@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Production-ready Telegram Bot: HLS → MP4 → YouTube Upload (Render optimized)"""
+"""Production-ready Telegram Bot: HLS → MP4 → YouTube Upload (Render optimized)
+OAuth state stored in persistent filesystem to survive process restarts."""
 
-import os, json, asyncio, logging, subprocess, tempfile, base64, threading, time
+import os, json, asyncio, logging, subprocess, tempfile, base64, threading, time, pickle
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Tuple
@@ -38,8 +39,10 @@ PROCESS_PID = os.getpid()
 
 CURRENT_DIR = Path.cwd()
 TOKEN_FILE = CURRENT_DIR / "google_token.json"
+OAUTH_STATE_DIR = TEMP_DIR / "oauth_states"
+OAUTH_STATE_DIR.mkdir(exist_ok=True)
+
 OAUTH_REDIRECT_URI = f"{RENDER_EXTERNAL_URL}/oauth/callback"
-OAUTH_STATE_STORE = {}
 
 WAITING_FOR_URL, CONFIRMING_UPLOAD, GETTING_TITLE, GETTING_DESCRIPTION, GETTING_VISIBILITY = range(5)
 
@@ -62,12 +65,74 @@ def log_process_info(context: str):
     
     logger.info(f"[DIAGNOSTIC:{context}] PID={current_pid} (started={PROCESS_PID}) elapsed={elapsed:.1f}s")
     logger.info(f"[DIAGNOSTIC:{context}] cwd={current_cwd}")
-    logger.info(f"[DIAGNOSTIC:{context}] TOKEN_FILE={TOKEN_FILE}")
     logger.info(f"[DIAGNOSTIC:{context}] TOKEN_FILE.resolve()={token_abs}")
-    logger.info(f"[DIAGNOSTIC:{context}] exists={TOKEN_FILE.exists()}")
-    if TOKEN_FILE.exists():
-        logger.info(f"[DIAGNOSTIC:{context}] size={TOKEN_FILE.stat().st_size}")
-        logger.info(f"[DIAGNOSTIC:{context}] mtime={datetime.fromtimestamp(TOKEN_FILE.stat().st_mtime)}")
+    logger.info(f"[DIAGNOSTIC:{context}] TOKEN_FILE.exists()={TOKEN_FILE.exists()}")
+    logger.info(f"[DIAGNOSTIC:{context}] OAUTH_STATE_DIR={OAUTH_STATE_DIR}")
+
+
+def save_oauth_state(state: str, flow: Flow) -> bool:
+    """Save OAuth Flow object to persistent filesystem.
+    
+    FIX for multi-process issue: Store in TEMP_DIR (shared across workers).
+    Uses pickle to serialize the Flow object.
+    """
+    try:
+        state_file = OAUTH_STATE_DIR / f"oauth_state_{state}.pickle"
+        logger.info(f"[OAUTH_PERSIST] Saving state {state[:20]}... to {state_file}")
+        
+        with open(state_file, 'wb') as f:
+            pickle.dump(flow, f)
+        
+        logger.info(f"[OAUTH_PERSIST] State saved, file size={state_file.stat().st_size}")
+        return True
+    except Exception as e:
+        logger.error(f"[OAUTH_PERSIST] Failed to save state: {type(e).__name__}: {e}")
+        return False
+
+
+def load_oauth_state(state: str) -> Optional[Flow]:
+    """Load OAuth Flow object from persistent filesystem.
+    
+    FIX for multi-process issue: Works even if state was stored in different process.
+    """
+    try:
+        state_file = OAUTH_STATE_DIR / f"oauth_state_{state}.pickle"
+        
+        if not state_file.exists():
+            logger.warning(f"[OAUTH_PERSIST] State file not found: {state_file}")
+            logger.warning(f"[OAUTH_PERSIST] Available states: {list(OAUTH_STATE_DIR.glob('oauth_state_*.pickle'))}")
+            return None
+        
+        logger.info(f"[OAUTH_PERSIST] Loading state from {state_file}")
+        
+        with open(state_file, 'rb') as f:
+            flow = pickle.load(f)
+        
+        logger.info(f"[OAUTH_PERSIST] State loaded successfully")
+        return flow
+    except Exception as e:
+        logger.error(f"[OAUTH_PERSIST] Failed to load state: {type(e).__name__}: {e}")
+        return None
+
+
+def pop_oauth_state(state: str) -> Optional[Flow]:
+    """Load and delete OAuth state (consume it)."""
+    try:
+        state_file = OAUTH_STATE_DIR / f"oauth_state_{state}.pickle"
+        
+        if not state_file.exists():
+            logger.warning(f"[OAUTH_PERSIST] State file not found for pop: {state_file}")
+            return None
+        
+        with open(state_file, 'rb') as f:
+            flow = pickle.load(f)
+        
+        state_file.unlink()
+        logger.info(f"[OAUTH_PERSIST] State consumed and deleted")
+        return flow
+    except Exception as e:
+        logger.error(f"[OAUTH_PERSIST] Failed to pop state: {type(e).__name__}: {e}")
+        return None
 
 
 class YouTubeOAuth:
@@ -178,7 +243,10 @@ class YouTubeOAuth:
             return False
 
     def get_authorization_url(self) -> Tuple[str, str]:
-        """Generate authorization URL and state for OAuth callback"""
+        """Generate authorization URL and state for OAuth callback.
+        
+        FIX: State is now stored in persistent filesystem, not RAM.
+        """
         try:
             logger.info(f"[OAUTH] Generating authorization URL")
             flow = Flow.from_client_config({
@@ -193,24 +261,33 @@ class YouTubeOAuth:
             auth_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
             logger.info(f"[OAUTH] Generated state: {state[:20]}...")
             
-            OAUTH_STATE_STORE[state] = flow
+            if not save_oauth_state(state, flow):
+                logger.error(f"[OAUTH] CRITICAL: Failed to persist state")
+                raise RuntimeError("Failed to save OAuth state")
+            
+            logger.info(f"[OAUTH] State persisted to filesystem")
             return auth_url, state
         except Exception as e:
             logger.error(f"[OAUTH] Failed: {type(e).__name__}: {e}")
             raise
 
     def handle_callback(self, code: str, state: str) -> bool:
-        """Exchange authorization code for credentials"""
+        """Exchange authorization code for credentials.
+        
+        FIX: State is loaded from persistent filesystem, works across processes.
+        """
         try:
             log_process_info("CALLBACK_START")
-            logger.info(f"[CALLBACK] START")
+            logger.info(f"[CALLBACK] START: state={state[:20]}...")
             
-            if state not in OAUTH_STATE_STORE:
-                logger.error(f"[CALLBACK] Invalid state")
+            flow = pop_oauth_state(state)
+            
+            if flow is None:
+                logger.error(f"[CALLBACK] Invalid state: {state}")
+                logger.error(f"[CALLBACK] State files available: {list(OAUTH_STATE_DIR.glob('oauth_state_*.pickle'))}")
                 return False
             
-            flow = OAUTH_STATE_STORE.pop(state)
-            logger.info(f"[CALLBACK] Calling flow.fetch_token()")
+            logger.info(f"[CALLBACK] State found, exchanging code for credentials")
             token_response = flow.fetch_token(code=code)
             
             self.credentials = flow.credentials
@@ -269,6 +346,10 @@ def oauth_callback():
     state = request.args.get("state")
     error = request.args.get("error")
     
+    logger.info(f"[OAUTH_CB] code={code[:20] if code else 'None'}...")
+    logger.info(f"[OAUTH_CB] state={state[:20] if state else 'None'}...")
+    logger.info(f"[OAUTH_CB] error={error}")
+    
     if error:
         logger.error(f"[OAUTH_CB] Google error: {error}")
         return f"❌ Authorization failed: {error}", 400
@@ -284,7 +365,7 @@ def oauth_callback():
             logger.error(f"[OAUTH_CB] handle_callback failed")
             log_process_info("OAUTH_CB_FAILED")
             logger.info("=" * 70)
-            return "❌ Failed to obtain credentials", 400
+            return "❌ Failed to obtain credentials. Check logs.", 400
         
         token_exists = TOKEN_FILE.exists()
         token_size = TOKEN_FILE.stat().st_size if token_exists else 0
@@ -650,6 +731,7 @@ def main():
     
     print("✅ FFmpeg ready")
     print(f"✅ Token: {TOKEN_FILE}")
+    print(f"✅ OAuth States Dir: {OAUTH_STATE_DIR}")
     print(f"✅ URL: {OAUTH_REDIRECT_URI}")
     
     app = Application.builder().token(BOT_TOKEN).build()
@@ -685,4 +767,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                            
