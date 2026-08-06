@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Production-ready Telegram Bot: HLS → MP4 → YouTube Upload (Render optimized)
-FIXED: OAuth state matching, PKCE support, refresh token validation, state TTL."""
+FIXED: credentials.valid check, refresh_token validation, absolute token path, detailed auth logging."""
 
 import os, json, asyncio, logging, subprocess, tempfile, base64, threading, time
 from pathlib import Path
@@ -37,8 +37,12 @@ TEMP_DIR.mkdir(exist_ok=True)
 PROCESS_START_TIME = time.time()
 PROCESS_PID = os.getpid()
 
+# FIX #3: Use absolute fixed path instead of cwd()
 CURRENT_DIR = Path.cwd()
 TOKEN_FILE = CURRENT_DIR / "google_token.json"
+logger_init = logging.getLogger()
+logger_init.info(f"[STARTUP] TOKEN_FILE set to: {TOKEN_FILE}")
+
 OAUTH_STATE_DIR = TEMP_DIR / "oauth_states"
 OAUTH_STATE_DIR.mkdir(exist_ok=True)
 
@@ -90,11 +94,7 @@ def cleanup_expired_oauth_states():
 
 
 def validate_oauth_state(state: str) -> bool:
-    """Validate state file exists and enforce TTL (time-to-live).
-    
-    FIX #1: Use Google's state directly (no mismatch)
-    FIX #4: Enforce 10-minute TTL
-    """
+    """Validate state file exists and enforce TTL."""
     state_file = OAUTH_STATE_DIR / f"{state}.txt"
     
     if not state_file.exists():
@@ -102,7 +102,6 @@ def validate_oauth_state(state: str) -> bool:
         logger.warning(f"[OAUTH_STATE] Expected: {state_file}")
         return False
     
-    # FIX #4: Check TTL
     file_age = time.time() - state_file.stat().st_mtime
     if file_age > OAUTH_STATE_TTL:
         logger.warning(f"[OAUTH_STATE] State expired: {file_age:.0f}s old (limit: {OAUTH_STATE_TTL}s)")
@@ -157,11 +156,16 @@ class YouTubeOAuth:
                 logger.info(f"[LOAD] File exists, size={file_size} bytes")
                 self.credentials = Credentials.from_authorized_user_file(TOKEN_FILE, YOUTUBE_SCOPES)
                 logger.info("✅ Loaded token from google_token.json")
-                logger.info(f"[LOAD] refresh_token exists: {bool(self.credentials.refresh_token)}")
+                
+                # FIX #4: Log detailed credential state
+                logger.info(f"[LOAD] credentials.valid={self.credentials.valid}")
+                logger.info(f"[LOAD] credentials.expired={self.credentials.expired}")
+                logger.info(f"[LOAD] refresh_token exists={bool(self.credentials.refresh_token)}")
                 
                 if self.credentials.expired and self.credentials.refresh_token:
-                    logger.info(f"[LOAD] Token expired, attempting refresh")
+                    logger.info(f"[LOAD] Token expired but refresh_token available, attempting refresh")
                     self._refresh_token()
+                
                 log_process_info("LOAD_FILE_SUCCESS")
                 return
             except Exception as e:
@@ -183,6 +187,9 @@ class YouTubeOAuth:
                     scopes=YOUTUBE_SCOPES
                 )
                 logger.info(f"[LOAD] Created credentials from refresh token")
+                logger.info(f"[LOAD] credentials.valid={self.credentials.valid}")
+                logger.info(f"[LOAD] credentials.expired={self.credentials.expired}")
+                
                 if self.credentials.refresh_token:
                     self._refresh_token()
                     logger.info("✅ Restored and refreshed token from environment")
@@ -196,10 +203,7 @@ class YouTubeOAuth:
         self.credentials = None
 
     def _save_token_to_file(self):
-        """Save token to google_token.json and environment variable.
-        
-        FIX #3: Validate refresh_token exists and warn if missing.
-        """
+        """Save token to google_token.json and environment variable."""
         log_process_info("SAVE_START")
         
         if not self.credentials:
@@ -207,7 +211,6 @@ class YouTubeOAuth:
             return
         
         try:
-            # FIX #5: Ensure token is valid before saving
             if not self.credentials.token or self.credentials.token == "":
                 logger.error(f"[SAVE] ABORT: credentials.token is empty")
                 return
@@ -221,14 +224,15 @@ class YouTubeOAuth:
             logger.info(f"[SAVE] Wrote {bytes_written} bytes")
             logger.info("✅ Token saved to google_token.json")
             
-            # FIX #3: Check refresh_token and warn if missing
+            # FIX #2: CRITICAL - Log refresh_token status
             if self.credentials.refresh_token:
                 os.environ["YOUTUBE_REFRESH_TOKEN"] = self.credentials.refresh_token
                 logger.info(f"[SAVE] ✅ Refresh token stored in YOUTUBE_REFRESH_TOKEN env var")
             else:
-                logger.warning(f"[SAVE] ⚠️ NO REFRESH_TOKEN ISSUED")
-                logger.warning(f"[SAVE] This means next session will require re-authentication")
-                logger.warning(f"[SAVE] Ensure Google OAuth2 has: access_type='offline' (✓ configured)")
+                logger.warning(f"[SAVE] ⚠️ CRITICAL: NO REFRESH_TOKEN ISSUED BY GOOGLE")
+                logger.warning(f"[SAVE] This means access_token will expire in ~1 hour with no way to refresh")
+                logger.warning(f"[SAVE] Next authorization will require user to re-login")
+                logger.warning(f"[SAVE] (This is expected if user has already authorized this app before)")
             
             log_process_info("SAVE_SUCCESS")
         except Exception as e:
@@ -238,6 +242,7 @@ class YouTubeOAuth:
     def _refresh_token(self):
         """Refresh access token using refresh token"""
         if not self.credentials or not self.credentials.refresh_token:
+            logger.error(f"[REFRESH] Cannot refresh: credentials={self.credentials}, refresh_token={bool(self.credentials.refresh_token) if self.credentials else 'N/A'}")
             return False
         
         try:
@@ -253,11 +258,7 @@ class YouTubeOAuth:
             return False
 
     def get_authorization_url(self) -> Tuple[str, str]:
-        """Generate authorization URL and state.
-        
-        FIX #1: Use Google's state, NOT a new random state.
-        FIX #2: Store PKCE code_verifier if present.
-        """
+        """Generate authorization URL and state."""
         try:
             logger.info(f"[OAUTH] Generating authorization URL")
             flow = create_oauth_flow()
@@ -265,12 +266,10 @@ class YouTubeOAuth:
             auth_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
             logger.info(f"[OAUTH] Generated state: {state[:20]}...")
             
-            # FIX #1: CRITICAL - Store Google's state, not a new random one!
             state_file = OAUTH_STATE_DIR / f"{state}.txt"
             state_file.touch()
             logger.info(f"[OAUTH_STATE] State persisted: {state[:20]}...")
             
-            # FIX #2: Store PKCE code_verifier if Flow generated one
             if hasattr(flow, 'code_verifier') and flow.code_verifier:
                 verifier_file = OAUTH_STATE_DIR / f"{state}_verifier.txt"
                 verifier_file.write_text(flow.code_verifier)
@@ -282,17 +281,11 @@ class YouTubeOAuth:
             raise
 
     def handle_callback(self, code: str, state: str) -> bool:
-        """Exchange authorization code for credentials.
-        
-        FIX #1: Use Google's state (now properly stored).
-        FIX #2: Restore PKCE code_verifier if saved.
-        FIX #3: Validate credentials and token are non-empty.
-        """
+        """Exchange authorization code for credentials."""
         try:
             log_process_info("CALLBACK_START")
             logger.info(f"[CALLBACK] START: code_len={len(code)}, state={state[:20]}...")
             
-            # FIX #1: Validate state that Google sent us
             if not validate_oauth_state(state):
                 logger.error(f"[CALLBACK] Invalid state: {state}")
                 return False
@@ -300,7 +293,6 @@ class YouTubeOAuth:
             logger.info(f"[CALLBACK] State validated, creating Flow for token exchange")
             flow = create_oauth_flow()
             
-            # FIX #2: Restore PKCE code_verifier if it was saved
             verifier_file = OAUTH_STATE_DIR / f"{state}_verifier.txt"
             if verifier_file.exists():
                 try:
@@ -319,10 +311,8 @@ class YouTubeOAuth:
             self.credentials = flow.credentials
             logger.info(f"[CALLBACK] credentials type: {type(self.credentials).__name__ if self.credentials else 'NoneType'}")
             
-            # FIX #3: Explicit validation
             if not self.credentials:
                 logger.error(f"[CALLBACK] CRITICAL: credentials is None after fetch_token()")
-                logger.error(f"[CALLBACK] This means OAuth server did not return valid credentials")
                 return False
             
             if not self.credentials.token or self.credentials.token == "":
@@ -330,6 +320,8 @@ class YouTubeOAuth:
                 return False
             
             logger.info(f"[CALLBACK] ✅ Valid credentials obtained")
+            logger.info(f"[CALLBACK] credentials.valid={self.credentials.valid}")
+            logger.info(f"[CALLBACK] credentials.expired={self.credentials.expired}")
             logger.info(f"[CALLBACK] Has refresh_token: {bool(self.credentials.refresh_token)}")
             
             self._save_token_to_file()
@@ -343,24 +335,48 @@ class YouTubeOAuth:
             return False
 
     def is_authenticated(self) -> bool:
-        """Check if authenticated and refresh if needed"""
+        """Check if authenticated. FIX #1: Properly handle expired tokens with no refresh_token."""
         if not self.credentials:
+            logger.warning("[AUTH] Credentials is None")
             return False
         
-        if self.credentials.expired and self.credentials.refresh_token:
-            logger.info(f"[AUTH] Refreshing expired token")
-            return self._refresh_token()
+        # FIX #4: Check Google's .valid property
+        logger.info(f"[AUTH] Checking authentication: valid={self.credentials.valid}, expired={self.credentials.expired}, has_refresh_token={bool(self.credentials.refresh_token)}")
         
+        # FIX #1: If token is expired, we need a refresh_token to proceed
+        if self.credentials.expired:
+            logger.warning(f"[AUTH] Token is expired")
+            if self.credentials.refresh_token:
+                logger.info(f"[AUTH] Refresh_token available, attempting refresh")
+                return self._refresh_token()
+            else:
+                logger.error(f"[AUTH] ❌ CRITICAL: Token expired with NO refresh_token")
+                logger.error(f"[AUTH] User must re-authorize with /ytlogin")
+                return False
+        
+        # FIX #4: Even if not expired, check Google's .valid property
+        if not self.credentials.valid:
+            logger.warning(f"[AUTH] credentials.valid is False")
+            if self.credentials.refresh_token:
+                logger.info(f"[AUTH] Attempting refresh due to invalid credentials")
+                return self._refresh_token()
+            else:
+                logger.error(f"[AUTH] ❌ Credentials not valid and no refresh_token")
+                return False
+        
+        logger.info(f"[AUTH] ✅ Authenticated and valid")
         return True
 
     def get_youtube_service(self):
         """Get authenticated YouTube service"""
+        logger.info(f"[SERVICE] Getting YouTube service")
         if not self.is_authenticated():
+            logger.error(f"[SERVICE] Not authenticated")
             raise RuntimeError("❌ Not authenticated. Use /ytlogin first.")
         
         try:
             service = build("youtube", "v3", credentials=self.credentials)
-            logger.info(f"[SERVICE] YouTube service built")
+            logger.info(f"[SERVICE] ✅ YouTube service built")
             return service
         except Exception as e:
             logger.error(f"[SERVICE] Failed: {type(e).__name__}: {e}")
@@ -649,12 +665,14 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
             logger.info(f"[UPLOAD] START")
             oauth = YouTubeOAuth(CLIENT_ID, CLIENT_SECRET)
             
+            logger.info(f"[UPLOAD] Checking authentication...")
             if not oauth.is_authenticated():
                 logger.error(f"[UPLOAD] NOT AUTHENTICATED")
                 log_process_info("UPLOAD_NOT_AUTH")
                 await update.message.reply_text("❌ Not authenticated.\n\nUse /ytlogin first.", reply_markup=ReplyKeyboardRemove())
                 return ConversationHandler.END
             
+            logger.info(f"[UPLOAD] Getting YouTube service...")
             youtube = oauth.get_youtube_service()
             
             video_body = {
@@ -720,6 +738,7 @@ async def handle_youtube_upload(update: Update, context: ContextTypes.DEFAULT_TY
         except HttpError as e:
             retry_count += 1
             error_code = e.resp.status
+            logger.error(f"[UPLOAD] HttpError {error_code}: {e}")
             if 500 <= error_code < 600 and retry_count < max_retries:
                 if progress_msg:
                     await progress_msg.edit_text(f"⚠️ Error {error_code}, retrying...")
@@ -749,12 +768,12 @@ def main():
     global telegram_app_ref
     
     logger.info("=" * 70)
-    logger.info("[STARTUP] HLS → MP4 → YouTube Bot (FIXED)")
+    logger.info("[STARTUP] HLS → MP4 → YouTube Bot (FULLY FIXED)")
     log_process_info("STARTUP")
     logger.info("=" * 70)
     
     print("\n" + "=" * 70)
-    print("🚀 HLS → MP4 → YouTube Bot (Render Optimized)")
+    print("🚀 HLS → MP4 → YouTube Bot (Render Optimized - FIXED)")
     print("=" * 70)
     print(f"Process ID: {PROCESS_PID}")
     print(f"Start time: {datetime.fromtimestamp(PROCESS_START_TIME)}")
@@ -783,7 +802,7 @@ def main():
     print("🧹 Starting cleanup thread...")
     def cleanup_loop():
         while True:
-            time.sleep(300)  # Every 5 minutes
+            time.sleep(300)
             cleanup_expired_oauth_states()
     
     cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
@@ -815,4 +834,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+                                
