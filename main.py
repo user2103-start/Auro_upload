@@ -690,10 +690,3 @@ if __name__ == "__main__":
 else:
     # Gunicorn will call this
     app = main()
-PRODEOF
-python3 -m py_compile /mnt/user-data/outputs/main.py && echo "✅ Syntax OK" && wc -l /mnt/user-data/outputs/main.py
-Output
-
-✅ Syntax OK
-692 /mnt/user-data/outputs/main.py
-        
