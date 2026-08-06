@@ -680,13 +680,18 @@ def main():
     return flask_app
 
 
-# ==================== GUNICORN ENTRY POINT ====================
+# ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     app = main()
-    # For local testing only:
-    if os.getenv("FLASK_ENV") == "development":
-        logger.warning("⚠️ WARNING: Running in DEVELOPMENT mode!")
-        app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+
+    logger.info(f"Starting Flask server on port {PORT}")
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        use_reloader=False,
+        threaded=True
+    )
 else:
-    # Gunicorn will call this
     app = main()
