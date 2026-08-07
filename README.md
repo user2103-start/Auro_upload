@@ -23,15 +23,41 @@ sirf optional hai (agar laptop ho to).
 | `SEND_TO_TELEGRAM` | `1` (optional) |
 | `TG_MAX_MB` | `50` (optional) |
 
-4. Google Cloud Console -> APIs & Services -> Credentials -> apna OAuth client
-   (Web application) kholo -> **Authorized redirect URIs** me add karo:
-   `https://<your-service>.onrender.com/oauth2callback` -> Save.
-5. Telegram me bot ko `/auth` bhejo -> link kholo -> Google login -> Allow.
-   Bot khud refresh token nikal ke tumhe chat me bhej dega.
+4. **Google Cloud Console me redirect URI add karna (bahut zaruri):**
+   - APIs & Services → Credentials → OAuth 2.0 Client IDs → apna **Web application** client kholo.
+   - **Authorized redirect URIs** → **ADD URI**.
+   - Exactly ye daalo (apne Render URL se replace karke):
+     ```
+     https://<your-service>.onrender.com/oauth2callback
+     ```
+   - **⚠️ Exact hona chahiye** — `http` nahi, end me `/` nahi, spelling galat nahi.
+   - **Save** kar do.
+5. Telegram me bot ko `/auth` bhejo. Bot tujhe exact redirect URI aur auth link dega.
+   - Link phone ke browser me kholo → apne YouTube waale Google account se login karo → Allow.
+   - Bot khud refresh token nikal ke tere chat me bhej dega.
 6. Us token ko Render env var `GOOGLE_REFRESH_TOKEN` me paste kar do
    (Render restart pe temp file mit jaati hai, isliye ye permanent fix hai).
 7. Ab `.m3u8` link paste karo -> title bhejo -> bot video chat me bhejega
    (agar size limit ke andar hai) aur YouTube pe upload karega.
+
+## Common errors
+
+### `Error 400: redirect_uri_mismatch`
+
+Ye tab aata hai jab Google Cloud me daali URI bot ke bheji hui URI se match nahi karti.
+
+Fix:
+1. Bot ko `/auth` bhejo.
+2. Bot jo exact URI dikhaye (jaise `https://abc.onrender.com/oauth2callback`), usko
+   Google Cloud Console → Credentials → Authorized redirect URIs me paste karo.
+3. **Save** karo.
+4. `/auth` dobara chalao.
+
+Galtiyaan jo log karte hain:
+- `http` instead of `https`
+- End me `/` lagana: `/oauth2callback/`
+- Spelling galat: `/oauth2-callback` ya `/oauthcallback`
+- Google Cloud me save kiye bina wapas `/auth` chalana
 
 ## Telegram file size ki sachai
 
