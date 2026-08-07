@@ -1,36 +1,59 @@
-# M3U8 -> YouTube Telegram bot
+# M3U8 -> Telegram + YouTube bot
 
-## Local / Render setup
+Sab kuch bot ke andar se hota hai — PC ki zarurat nahi. `get_refresh_token.py`
+sirf optional hai (agar laptop ho to).
 
-1. `pip install -r requirements.txt`
-2. Get a YouTube refresh token once, on your own machine:
-   ```
-   export GOOGLE_CLIENT_ID=...
-   export GOOGLE_CLIENT_SECRET=...
-   python get_refresh_token.py
-   ```
-3. Deploy on Render as a **Web Service** (free tier):
+## Deploy steps (Render free tier)
+
+1. Is repo ko GitHub pe push karo.
+2. Render pe **New > Web Service** -> repo select karo.
+   - Root directory: `bot`
    - Build command: `pip install -r requirements.txt`
    - Start command: `python main.py`
-   - Env vars: `TELEGRAM_BOT_TOKEN`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
-     `GOOGLE_REFRESH_TOKEN`, `ALLOWED_USER_IDS`, optional `PRIVACY_STATUS`, `MAX_MINUTES`
-   - The bot binds `$PORT` with a `/healthz` endpoint so Render keeps it alive.
+3. Env vars daalo:
 
-## Free tier limits to keep in mind
+| Name | Value |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | @BotFather se |
+| `GOOGLE_CLIENT_ID` | Google Cloud (Web application client) |
+| `GOOGLE_CLIENT_SECRET` | Google Cloud |
+| `PUBLIC_URL` | `https://<your-service>.onrender.com` |
+| `ALLOWED_USER_IDS` | apna Telegram id (bot me `/whoami`) |
+| `PRIVACY_STATUS` | `unlisted` (optional) |
+| `SEND_TO_TELEGRAM` | `1` (optional) |
+| `TG_MAX_MB` | `50` (optional) |
 
-- 512 MB RAM / 0.1 CPU: we use `ffmpeg -c copy` (remux only, no re-encode).
-- Disk is ephemeral and small: each video is written to a temp dir and deleted
-  after upload. Keep recordings short (`MAX_MINUTES`).
-- Free web services sleep after 15 min idle; the first message after sleep can
-  take ~30 s to wake up. A cron ping to `/healthz` avoids that.
-- YouTube API quota: 10,000 units/day ≈ 6 uploads/day per project. Ask Google
-  for a quota increase if you need more.
-- Fresh OAuth apps in "Testing" mode upload as `private` and the refresh token
-  expires in 7 days — publish the OAuth consent screen to fix that.
+4. Google Cloud Console -> APIs & Services -> Credentials -> apna OAuth client
+   (Web application) kholo -> **Authorized redirect URIs** me add karo:
+   `https://<your-service>.onrender.com/oauth2callback` -> Save.
+5. Telegram me bot ko `/auth` bhejo -> link kholo -> Google login -> Allow.
+   Bot khud refresh token nikal ke tumhe chat me bhej dega.
+6. Us token ko Render env var `GOOGLE_REFRESH_TOKEN` me paste kar do
+   (Render restart pe temp file mit jaati hai, isliye ye permanent fix hai).
+7. Ab `.m3u8` link paste karo -> title bhejo -> bot video chat me bhejega
+   (agar size limit ke andar hai) aur YouTube pe upload karega.
 
-## Future extensions (easy hooks)
+## Telegram file size ki sachai
 
-- `download_m3u8()` -> swap in `yt-dlp` to support YouTube/other page URLs.
-- Direct mp4 links: skip ffmpeg, stream the file straight to `upload_to_youtube()`.
-- Telegram video files: `update.message.video.get_file()` then upload.
+Telegram *users* 2 GB (premium 4 GB) tak bhej sakte hain, lekin **bots ka
+upload limit 50 MB hai** normal Bot API se. 2 GB tak bhejne ke liye apna
+"local Bot API server" chalana padta hai — Render free tier pe wo practical
+nahi hai. Isliye: chhoti file -> Telegram + YouTube, badi file -> sirf YouTube
+(link chat me aa jaayega).
 
+## Free tier limits
+
+- 512 MB RAM / 0.1 CPU: `ffmpeg -c copy` (remux only, no re-encode).
+- Disk ephemeral: video temp dir me banta hai, upload ke baad delete.
+- Free service 15 min idle ke baad sleep; pehla message ~30 s le sakta hai.
+  `/healthz` pe cron ping laga do.
+- YouTube quota: 10,000 units/day ≈ 6 uploads/day.
+- OAuth consent screen "Testing" me ho to refresh token 7 din me expire hota
+  hai — usko **Publish** kar do. Test user me apna mail add rakhna zaruri hai.
+
+## Future hooks
+
+- `download_m3u8()` -> `yt-dlp` daal do, baaki URLs bhi chalenge.
+- Direct mp4 link -> ffmpeg skip, seedha `upload_to_youtube()`.
+- Telegram video file -> `update.message.video.get_file()` phir upload.
+- 
