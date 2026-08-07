@@ -260,9 +260,15 @@ async def auth(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
     url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
     await update.message.reply_text(
-        "Ye link phone ke browser me kholo, apne YouTube waale Google account se "
-        "login karo aur Allow dabao. Token main khud pakad lunga 👇\n\n" + url,
+        "📋 Pehle ye exact URL Google Cloud Console me add karo:\n\n"
+        f"`{REDIRECT_URI}`\n\n"
+        "Path: APIs & Services → Credentials → OAuth 2.0 Client IDs → "
+        "Authorized redirect URIs → ADD URI → paste → Save.\n\n"
+        "Uske baad neeche wali link phone ke browser me kholo, apne YouTube waale "
+        "Google account se login karo aur Allow dabao. Token main khud pakad lunga 👇\n\n"
+        + url,
         disable_web_page_preview=True,
+        parse_mode="Markdown",
     )
 
 
@@ -440,3 +446,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+      
