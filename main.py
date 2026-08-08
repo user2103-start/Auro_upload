@@ -1,5 +1,5 @@
 """
-Telegram -> M3U8 downloader -> YouTube uploader bot.
+Telegram -> (M3U8 / MP4 URL / MP4 file) -> YouTube uploader bot.
 
 Designed for Render free tier (single web service, 512 MB RAM, ephemeral disk).
 
@@ -21,13 +21,17 @@ PRIVACY_STATUS         private | unlisted | public   (default: unlisted)
 MAX_MINUTES            hard cap on recording length (default: 120)
 SEND_TO_TELEGRAM       1 | 0  -> also send the mp4 back into the chat (default 1)
 TG_MAX_MB              max size to try sending on Telegram (default 50)
+MAX_FILE_MB            hard cap on downloaded file size (default 2000)
+MIN_FREE_DISK_MB       abort download if free disk drops below this (default 300)
 
 Usage in Telegram
 -----------------
 /start   help
 /auth    login to YouTube from your phone browser (no PC needed)
 /whoami  show your Telegram user id
-paste an .m3u8 URL -> bot asks for a title -> downloads -> sends -> uploads
+/disk    show free disk space on the server
+paste an .m3u8 or .mp4 URL  -> bot asks for a title -> downloads -> uploads
+send a video / mp4 document -> bot asks for a title -> uploads
 /cancel  abort the current conversation
 """
 
@@ -78,10 +82,13 @@ MAX_MINUTES = int(os.environ.get("MAX_MINUTES", "120"))
 PORT = int(os.environ.get("PORT", "10000"))
 SEND_TO_TELEGRAM = os.environ.get("SEND_TO_TELEGRAM", "1") not in ("0", "false", "no")
 TG_MAX_MB = float(os.environ.get("TG_MAX_MB", "50"))
+MAX_FILE_MB = float(os.environ.get("MAX_FILE_MB", "2000"))
+MIN_FREE_DISK_MB = float(os.environ.get("MIN_FREE_DISK_MB", "300"))
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 REDIRECT_URI = f"{PUBLIC_URL}/oauth2callback" if PUBLIC_URL else ""
 TOKEN_FILE = os.path.join(tempfile.gettempdir(), "yt_refresh_token.json")
+WORK_ROOT = os.path.join(tempfile.gettempdir(), "bot-work")
 
 ASK_TITLE = 1
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -89,6 +96,20 @@ URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 # chat_id per pending oauth "state" so we can DM the token back
 PENDING_AUTH: dict[str, int] = {}
 TG_APP: Application | None = None
+
+
+# --------------------------------------------------------------------------- #
+# disk helpers
+# --------------------------------------------------------------------------- #
+def free_disk_mb(path: str | None = None) -> float:
+    usage = shutil.disk_usage(path or tempfile.gettempdir())
+    return usage.free / (1024 * 1024)
+
+
+def cleanup_workdir() -> None:
+    """Kill any leftover temp dirs from crashed/killed jobs."""
+    shutil.rmtree(WORK_ROOT, ignore_errors=True)
+    os.makedirs(WORK_ROOT, exist_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -126,6 +147,33 @@ def ffmpeg_path() -> str:
 FFMPEG = ffmpeg_path()
 
 
+def looks_like_hls(url: str) -> bool:
+    clean = url.split("?")[0].lower()
+    return clean.endswith(".m3u8") or ".m3u8" in url.lower()
+
+
+async def _watch_disk(out_path: str, proc: asyncio.subprocess.Process) -> str | None:
+    """Kill the download if it grows past the cap or the disk is about to fill."""
+    reason: str | None = None
+    while proc.returncode is None:
+        await asyncio.sleep(3)
+        try:
+            size_mb = os.path.getsize(out_path) / (1024 * 1024)
+        except OSError:
+            size_mb = 0.0
+        if size_mb > MAX_FILE_MB:
+            reason = f"File {size_mb:.0f} MB se bada ho gaya (limit {MAX_FILE_MB:.0f} MB)."
+        elif free_disk_mb() < MIN_FREE_DISK_MB:
+            reason = "Server ka disk bharne waala tha, download rok diya."
+        if reason:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return reason
+    return None
+
+
 async def download_m3u8(url: str, out_path: str) -> None:
     """Remux the HLS stream straight into an mp4 (no re-encode -> low CPU/RAM)."""
     cmd = [
@@ -153,11 +201,48 @@ async def download_m3u8(url: str, out_path: str) -> None:
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
+    watcher = asyncio.create_task(_watch_disk(out_path, proc))
     _, stderr = await proc.communicate()
+    abort_reason = await watcher
+    if abort_reason:
+        raise RuntimeError(abort_reason)
     if proc.returncode != 0:
         raise RuntimeError((stderr or b"").decode()[-1500:] or "ffmpeg failed")
     if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
         raise RuntimeError("Downloaded file is empty. Is the link still live?")
+
+
+async def download_direct(url: str, out_path: str) -> None:
+    """Stream a direct video URL (mp4/mkv/webm...) to disk in small chunks."""
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=120)
+    written = 0
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"Link ne HTTP {resp.status} diya.")
+            declared = resp.headers.get("Content-Length")
+            if declared and int(declared) / (1024 * 1024) > MAX_FILE_MB:
+                raise RuntimeError(
+                    f"File {int(declared) / (1024 * 1024):.0f} MB hai, "
+                    f"limit {MAX_FILE_MB:.0f} MB."
+                )
+            with open(out_path, "wb") as fh:
+                async for chunk in resp.content.iter_chunked(1024 * 512):
+                    fh.write(chunk)
+                    written += len(chunk)
+                    if written / (1024 * 1024) > MAX_FILE_MB:
+                        raise RuntimeError(f"File limit {MAX_FILE_MB:.0f} MB se bada hai.")
+                    if written % (1024 * 1024 * 32) < 1024 * 512 and free_disk_mb() < MIN_FREE_DISK_MB:
+                        raise RuntimeError("Server ka disk bharne waala tha, download rok diya.")
+    if written < 1024:
+        raise RuntimeError("Downloaded file is empty. Link check karo.")
+
+
+async def download_any(url: str, out_path: str) -> None:
+    if looks_like_hls(url):
+        await download_m3u8(url, out_path)
+    else:
+        await download_direct(url, out_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -180,7 +265,7 @@ def youtube_client():
 
 
 def upload_to_youtube(path: str, title: str, description: str) -> str:
-    """Blocking resumable upload. Call from a worker thread."""
+    """Blocking resumable upload with retries. Call from a worker thread."""
     yt = youtube_client()
     body = {
         "snippet": {
@@ -194,8 +279,18 @@ def upload_to_youtube(path: str, title: str, description: str) -> str:
     request = yt.videos().insert(part="snippet,status", body=body, media_body=media)
 
     response = None
+    errors = 0
     while response is None:
-        _, response = request.next_chunk()
+        try:
+            _, response = request.next_chunk()
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            if errors > 8:
+                raise
+            log.warning("upload chunk failed (%s/8): %s", errors, exc)
+            import time
+
+            time.sleep(min(2**errors, 60))
     return response["id"]
 
 
@@ -204,7 +299,9 @@ def upload_to_youtube(path: str, title: str, description: str) -> str:
 # --------------------------------------------------------------------------- #
 @dataclass
 class Job:
-    url: str
+    url: str = ""
+    tg_file_id: str = ""
+    source_label: str = ""
     title: str = ""
     extras: dict = field(default_factory=dict)
 
@@ -219,18 +316,30 @@ def authorized(update: Update) -> bool:
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     connected = "✅ connected" if load_refresh_token() else "❌ not connected (/auth chalao)"
     await update.message.reply_text(
-        "Bhej de ek .m3u8 link, main use download karke tere YouTube channel pe "
-        f"upload kar dunga ({PRIVACY_STATUS}).\n\n"
+        "Main ye sab le sakta hoon:\n"
+        "• .m3u8 link\n"
+        "• direct video link (.mp4 / .mkv / .webm)\n"
+        "• Telegram pe bheji hui video ya mp4 file (max ~20 MB, Bot API limit)\n\n"
+        f"Sab kuch tere YouTube channel pe jaayega ({PRIVACY_STATUS}). "
+        f"Chhoti file ({TG_MAX_MB:.0f} MB tak) chat me bhi bhej dunga, badi ka "
+        "sirf YouTube link aayega.\n\n"
         f"YouTube: {connected}\n\n"
-        "/auth  – phone browser se YouTube login (PC ki zarurat nahi)\n"
+        "/auth  – phone browser se YouTube login\n"
         "/whoami – tera Telegram user id\n"
-        "/cancel – abort\n\n"
-        "1. Link paste karo\n2. Title bhejo\n3. Done"
+        "/disk – server ka free space\n"
+        "/cancel – abort"
     )
 
 
 async def whoami(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Your Telegram user id: {update.effective_user.id}")
+
+
+async def disk(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    cleanup_workdir()
+    await update.message.reply_text(
+        f"Free disk: {free_disk_mb():.0f} MB (temp files clean kar diye)."
+    )
 
 
 async def auth(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -259,17 +368,17 @@ async def auth(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     from urllib.parse import urlencode
 
     url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    # NOTE: no parse_mode here — Markdown eats the underscores in client_id/redirect_uri
     await update.message.reply_text(
         "📋 Pehle ye exact URL Google Cloud Console me add karo:\n\n"
-        f"`{REDIRECT_URI}`\n\n"
+        f"{REDIRECT_URI}\n\n"
         "Path: APIs & Services → Credentials → OAuth 2.0 Client IDs → "
         "Authorized redirect URIs → ADD URI → paste → Save.\n\n"
         "Uske baad neeche wali link phone ke browser me kholo, apne YouTube waale "
-        "Google account se login karo aur Allow dabao. Token main khud pakad lunga 👇\n\n"
-        + url,
+        "Google account se login karo aur Allow dabao. Token main khud pakad lunga 👇",
         disable_web_page_preview=True,
-        parse_mode="Markdown",
     )
+    await update.message.reply_text(url, disable_web_page_preview=True)
 
 
 async def exchange_code(code: str) -> str:
@@ -300,8 +409,43 @@ async def got_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Valid http(s) link nahi mila. Dobara try karo.")
         return ConversationHandler.END
 
-    context.user_data["job"] = Job(url=match.group(0))
-    await update.message.reply_text("Link mil gaya. Ab video ka title bhejo:")
+    url = match.group(0)
+    kind = "HLS (.m3u8)" if looks_like_hls(url) else "direct video link"
+    context.user_data["job"] = Job(url=url, source_label=url)
+    await update.message.reply_text(f"{kind} mil gaya. Ab video ka title bhejo:")
+    return ASK_TITLE
+
+
+async def got_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Telegram video / mp4 document -> upload to YouTube."""
+    if not authorized(update):
+        await update.message.reply_text("Sorry, you are not allowed to use this bot.")
+        return ConversationHandler.END
+
+    msg = update.message
+    media = msg.video or msg.document
+    if media is None:
+        return ConversationHandler.END
+
+    name = getattr(media, "file_name", None) or "video.mp4"
+    mime = (getattr(media, "mime_type", "") or "").lower()
+    if msg.document and not (mime.startswith("video/") or name.lower().endswith(
+        (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+    )):
+        await msg.reply_text("Ye video file nahi lagti. mp4/mkv/webm bhejo.")
+        return ConversationHandler.END
+
+    size_mb = (media.file_size or 0) / (1024 * 1024)
+    if size_mb > 20:
+        await msg.reply_text(
+            f"File {size_mb:.1f} MB hai. Bot API se main sirf 20 MB tak ki file "
+            "download kar sakta hoon 😕 Uska direct link (mp4 URL) bhej de, "
+            "phir main YouTube pe daal dunga."
+        )
+        return ConversationHandler.END
+
+    context.user_data["job"] = Job(tg_file_id=media.file_id, source_label=f"Telegram file: {name}")
+    await msg.reply_text("File mil gayi. Ab video ka title bhejo:")
     return ASK_TITLE
 
 
@@ -309,18 +453,34 @@ async def got_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     job: Job = context.user_data["job"]
     job.title = (update.message.text or "").strip() or "Untitled"
 
+    if free_disk_mb() < MIN_FREE_DISK_MB:
+        cleanup_workdir()
+
     msg = await update.message.reply_text("Downloading… (thoda time lagega)")
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
-    tmpdir = tempfile.mkdtemp(prefix="m3u8-")
+    os.makedirs(WORK_ROOT, exist_ok=True)
+    tmpdir = tempfile.mkdtemp(prefix="job-", dir=WORK_ROOT)
     out = os.path.join(tmpdir, "video.mp4")
     try:
-        await download_m3u8(job.url, out)
-        size_mb = os.path.getsize(out) / (1024 * 1024)
-        await msg.edit_text(f"Download done ({size_mb:.1f} MB).")
+        if job.tg_file_id:
+            tg_file = await context.bot.get_file(job.tg_file_id)
+            await tg_file.download_to_drive(out)
+        else:
+            await download_any(job.url, out)
 
-        # 1) send the file back into the chat
-        if SEND_TO_TELEGRAM:
+        size_mb = os.path.getsize(out) / (1024 * 1024)
+        await msg.edit_text(f"Download done ({size_mb:.1f} MB). YouTube pe bhej raha hoon…")
+
+        # 1) YouTube first — ye zaroori step hai, disk jaldi khaali ho jaaye
+        video_id = await asyncio.to_thread(
+            upload_to_youtube, out, job.title, f"Source: {job.source_label or job.url}"
+        )
+        yt_link = f"https://youtu.be/{video_id}"
+        await msg.edit_text(f"YouTube pe chala gaya ✅\n{yt_link}")
+
+        # 2) chhoti file ho to chat me bhi bhej do
+        if SEND_TO_TELEGRAM and not job.tg_file_id:
             if size_mb <= TG_MAX_MB:
                 try:
                     await context.bot.send_chat_action(
@@ -337,30 +497,29 @@ async def got_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                         )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("telegram send failed: %s", exc)
-                    await update.message.reply_text(f"Telegram pe bhej nahi paya: {exc}")
+                    await update.message.reply_text(
+                        f"Chat me bhej nahi paya ({exc}) — YouTube link upar hai 👆"
+                    )
             else:
                 await update.message.reply_text(
-                    f"File {size_mb:.1f} MB hai, Telegram bot upload limit "
-                    f"{TG_MAX_MB:.0f} MB hai — sirf YouTube pe jaayega."
+                    f"File {size_mb:.1f} MB hai (Telegram bot limit {TG_MAX_MB:.0f} MB), "
+                    f"isliye sirf YouTube pe gayi:\n{yt_link}"
                 )
-
-        # 2) upload to YouTube
-        await msg.edit_text(f"Uploading to YouTube… ({size_mb:.1f} MB)")
-        video_id = await asyncio.to_thread(
-            upload_to_youtube, out, job.title, f"Source: {job.url}"
-        )
-        await msg.edit_text(f"Ho gaya bhai ✅\nhttps://youtu.be/{video_id}")
     except Exception as exc:  # noqa: BLE001
         log.exception("job failed")
         await msg.edit_text(f"Fail ho gaya ❌\n\n{exc}")
     finally:
+        # file kabhi server pe nahi rukni chahiye
         shutil.rmtree(tmpdir, ignore_errors=True)
+        cleanup_workdir()
         context.user_data.pop("job", None)
+        log.info("cleanup done, free disk %.0f MB", free_disk_mb())
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("job", None)
+    cleanup_workdir()
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
@@ -390,12 +549,12 @@ async def run_web_server() -> None:
                 chat_id=chat_id,
                 text=(
                     "YouTube connect ho gaya ✅\n\n"
-                    "Ise Render ke env var *GOOGLE_REFRESH_TOKEN* me paste kar de "
-                    "(warna restart pe dobara /auth karna padega):\n\n"
-                    f"`{refresh_token}`"
+                    "Ise Render ke env var GOOGLE_REFRESH_TOKEN me paste kar de "
+                    "(warna restart pe dobara /auth karna padega):"
                 ),
-                parse_mode="Markdown",
             )
+            # plain text, no Markdown — token me _ aur - hote hain
+            await TG_APP.bot.send_message(chat_id=chat_id, text=refresh_token)
         return web.Response(
             text="Done! Telegram pe wapas jao, token bot ne bhej diya hai.",
             content_type="text/plain",
@@ -413,6 +572,7 @@ async def run_web_server() -> None:
 
 async def main() -> None:
     global TG_APP
+    cleanup_workdir()
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -423,7 +583,10 @@ async def main() -> None:
     TG_APP = application
 
     conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, got_url)],
+        entry_points=[
+            MessageHandler(filters.TEXT & ~filters.COMMAND, got_url),
+            MessageHandler(filters.VIDEO | filters.Document.ALL, got_file),
+        ],
         states={ASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_title)]},
         fallbacks=[CommandHandler("cancel", cancel)],
         conversation_timeout=600,
@@ -432,6 +595,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("auth", auth))
     application.add_handler(CommandHandler("whoami", whoami))
+    application.add_handler(CommandHandler("disk", disk))
     application.add_handler(conv)
 
     await run_web_server()
@@ -446,4 +610,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-      
