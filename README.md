@@ -37,8 +37,24 @@ sirf optional hai (agar laptop ho to).
    - Bot khud refresh token nikal ke tere chat me bhej dega.
 6. Us token ko Render env var `GOOGLE_REFRESH_TOKEN` me paste kar do
    (Render restart pe temp file mit jaati hai, isliye ye permanent fix hai).
-7. Ab `.m3u8` link paste karo -> title bhejo -> bot video chat me bhejega
-   (agar size limit ke andar hai) aur YouTube pe upload karega.
+7. Ab bhej sakte ho:
+   - `.m3u8` link
+   - direct video link (`.mp4` / `.mkv` / `.webm`)
+   - Telegram pe video ya mp4 file (max ~20 MB — Bot API download limit)
+
+   Flow: source bhejo → title bhejo → bot **pehle YouTube pe upload karta hai**,
+   link deta hai, phir chhoti file ho to chat me bhi bhej deta hai. File turant
+   server se delete ho jaati hai.
+
+### Extra env vars (optional)
+
+| Name | Default | Kaam |
+|---|---|---|
+| `MAX_FILE_MB` | `2000` | isse badi file download hi nahi hogi |
+| `MIN_FREE_DISK_MB` | `300` | free space itna se kam hua to download abort |
+
+`/disk` command se free space dekh sakte ho aur temp files clean ho jaati hain.
+
 
 ## Common errors
 
