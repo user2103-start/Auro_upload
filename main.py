@@ -44,7 +44,9 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -84,6 +86,8 @@ SEND_TO_TELEGRAM = os.environ.get("SEND_TO_TELEGRAM", "1") not in ("0", "false",
 TG_MAX_MB = float(os.environ.get("TG_MAX_MB", "50"))
 MAX_FILE_MB = float(os.environ.get("MAX_FILE_MB", "2000"))
 MIN_FREE_DISK_MB = float(os.environ.get("MIN_FREE_DISK_MB", "300"))
+# how many HLS segments / http chunks to fetch in parallel (speed knob)
+PARALLEL_CONNS = int(os.environ.get("PARALLEL_CONNS", "16"))
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 REDIRECT_URI = f"{PUBLIC_URL}/oauth2callback" if PUBLIC_URL else ""
@@ -107,9 +111,28 @@ def free_disk_mb(path: str | None = None) -> float:
 
 
 def cleanup_workdir() -> None:
-    """Kill any leftover temp dirs from crashed/killed jobs."""
-    shutil.rmtree(WORK_ROOT, ignore_errors=True)
+    """Instantly free the work dir: rename it away, delete in a background thread."""
     os.makedirs(WORK_ROOT, exist_ok=True)
+    try:
+        entries = os.listdir(WORK_ROOT)
+    except OSError:
+        entries = []
+    if not entries:
+        return
+    doomed = f"{WORK_ROOT}-trash-{secrets.token_hex(4)}"
+    try:
+        os.rename(WORK_ROOT, doomed)
+        os.makedirs(WORK_ROOT, exist_ok=True)
+    except OSError:
+        doomed = WORK_ROOT
+    threading.Thread(target=shutil.rmtree, args=(doomed,), kwargs={"ignore_errors": True},
+                     daemon=True).start()
+    # aur purane trash dirs bhi saaf kar do
+    parent = os.path.dirname(WORK_ROOT)
+    for name in os.listdir(parent):
+        if name.startswith(os.path.basename(WORK_ROOT) + "-trash-"):
+            threading.Thread(target=shutil.rmtree, args=(os.path.join(parent, name),),
+                             kwargs={"ignore_errors": True}, daemon=True).start()
 
 
 # --------------------------------------------------------------------------- #
@@ -152,15 +175,24 @@ def looks_like_hls(url: str) -> bool:
     return clean.endswith(".m3u8") or ".m3u8" in url.lower()
 
 
+def _dir_size_mb(path: str) -> float:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total / (1024 * 1024)
+
+
 async def _watch_disk(out_path: str, proc: asyncio.subprocess.Process) -> str | None:
     """Kill the download if it grows past the cap or the disk is about to fill."""
+    workdir = os.path.dirname(out_path)
     reason: str | None = None
     while proc.returncode is None:
         await asyncio.sleep(3)
-        try:
-            size_mb = os.path.getsize(out_path) / (1024 * 1024)
-        except OSError:
-            size_mb = 0.0
+        size_mb = _dir_size_mb(workdir)
         if size_mb > MAX_FILE_MB:
             reason = f"File {size_mb:.0f} MB se bada ho gaya (limit {MAX_FILE_MB:.0f} MB)."
         elif free_disk_mb() < MIN_FREE_DISK_MB:
@@ -174,8 +206,62 @@ async def _watch_disk(out_path: str, proc: asyncio.subprocess.Process) -> str | 
     return None
 
 
-async def download_m3u8(url: str, out_path: str) -> None:
-    """Remux the HLS stream straight into an mp4 (no re-encode -> low CPU/RAM)."""
+async def _run_downloader(cmd: list[str], out_path: str) -> tuple[int, str, str | None]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    watcher = asyncio.create_task(_watch_disk(out_path, proc))
+    _, stderr = await proc.communicate()
+    abort_reason = await watcher
+    return proc.returncode or 0, (stderr or b"").decode()[-1500:], abort_reason
+
+
+def _origin(url: str) -> str:
+    parts = url.split("/")
+    return parts[0] + "//" + parts[2] if len(parts) > 2 else url
+
+
+async def download_m3u8_ytdlp(url: str, out_path: str) -> None:
+    """Fast path: yt-dlp fetches many segments in parallel, then ffmpeg remuxes."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--no-warnings",
+        "--no-progress",
+        "--no-part",
+        "--no-playlist",
+        "--concurrent-fragments",
+        str(PARALLEL_CONNS),
+        "--retries",
+        "10",
+        "--fragment-retries",
+        "20",
+        "--http-chunk-size",
+        "10M",
+        "--user-agent",
+        "Mozilla/5.0",
+        "--referer",
+        _origin(url),
+        "--ffmpeg-location",
+        FFMPEG,
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        out_path,
+        url,
+    ]
+    code, stderr, abort_reason = await _run_downloader(cmd, out_path)
+    if abort_reason:
+        raise RuntimeError(abort_reason)
+    if code != 0:
+        raise RuntimeError(stderr or "yt-dlp failed")
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+        raise RuntimeError("yt-dlp output empty")
+
+
+async def download_m3u8_ffmpeg(url: str, out_path: str) -> None:
+    """Fallback: remux the HLS stream straight into an mp4 (slow but reliable)."""
     cmd = [
         FFMPEG,
         "-hide_banner",
@@ -185,7 +271,7 @@ async def download_m3u8(url: str, out_path: str) -> None:
         "-user_agent",
         "Mozilla/5.0",
         "-headers",
-        "Referer: {}\r\n".format(url.split("/")[0] + "//" + url.split("/")[2]),
+        "Referer: {}\r\n".format(_origin(url)),
         "-i",
         url,
         "-t",
@@ -198,44 +284,92 @@ async def download_m3u8(url: str, out_path: str) -> None:
         "+faststart",
         out_path,
     ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    watcher = asyncio.create_task(_watch_disk(out_path, proc))
-    _, stderr = await proc.communicate()
-    abort_reason = await watcher
+    code, stderr, abort_reason = await _run_downloader(cmd, out_path)
     if abort_reason:
         raise RuntimeError(abort_reason)
-    if proc.returncode != 0:
-        raise RuntimeError((stderr or b"").decode()[-1500:] or "ffmpeg failed")
+    if code != 0:
+        raise RuntimeError(stderr or "ffmpeg failed")
     if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
         raise RuntimeError("Downloaded file is empty. Is the link still live?")
 
 
+async def download_m3u8(url: str, out_path: str) -> None:
+    try:
+        await download_m3u8_ytdlp(url, out_path)
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("yt-dlp fast path failed, ffmpeg pe fallback: %s", exc)
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+    await download_m3u8_ffmpeg(url, out_path)
+
+
+async def _fetch_range(
+    session: aiohttp.ClientSession, url: str, out_path: str, start: int, end: int
+) -> None:
+    headers = {"User-Agent": "Mozilla/5.0", "Range": f"bytes={start}-{end}"}
+    async with session.get(url, headers=headers) as resp:
+        if resp.status not in (200, 206):
+            raise RuntimeError(f"Range request ne HTTP {resp.status} diya.")
+        with open(out_path, "r+b") as fh:
+            fh.seek(start)
+            async for chunk in resp.content.iter_chunked(1024 * 512):
+                fh.write(chunk)
+
+
 async def download_direct(url: str, out_path: str) -> None:
-    """Stream a direct video URL (mp4/mkv/webm...) to disk in small chunks."""
+    """Direct video URL: parallel ranged connections jab server support kare."""
     timeout = aiohttp.ClientTimeout(total=None, sock_read=120)
-    written = 0
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = aiohttp.TCPConnector(limit=PARALLEL_CONNS + 4)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        total = 0
+        ranges_ok = False
+        try:
+            async with session.head(
+                url, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True
+            ) as head:
+                total = int(head.headers.get("Content-Length") or 0)
+                ranges_ok = head.headers.get("Accept-Ranges", "").lower() == "bytes"
+        except Exception:  # noqa: BLE001
+            pass
+
+        if total / (1024 * 1024) > MAX_FILE_MB:
+            raise RuntimeError(
+                f"File {total / (1024 * 1024):.0f} MB hai, limit {MAX_FILE_MB:.0f} MB."
+            )
+
+        if ranges_ok and total > 8 * 1024 * 1024:
+            with open(out_path, "wb") as fh:
+                fh.truncate(total)
+            parts = PARALLEL_CONNS
+            chunk = -(-total // parts)
+            tasks = [
+                _fetch_range(session, url, out_path, i * chunk, min((i + 1) * chunk - 1, total - 1))
+                for i in range(parts)
+                if i * chunk < total
+            ]
+            await asyncio.gather(*tasks)
+            if os.path.getsize(out_path) < 1024:
+                raise RuntimeError("Downloaded file is empty. Link check karo.")
+            return
+
+        # single stream fallback
+        written = 0
         async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
             if resp.status >= 400:
                 raise RuntimeError(f"Link ne HTTP {resp.status} diya.")
-            declared = resp.headers.get("Content-Length")
-            if declared and int(declared) / (1024 * 1024) > MAX_FILE_MB:
-                raise RuntimeError(
-                    f"File {int(declared) / (1024 * 1024):.0f} MB hai, "
-                    f"limit {MAX_FILE_MB:.0f} MB."
-                )
             with open(out_path, "wb") as fh:
-                async for chunk in resp.content.iter_chunked(1024 * 512):
-                    fh.write(chunk)
-                    written += len(chunk)
+                async for chunk_b in resp.content.iter_chunked(1024 * 1024):
+                    fh.write(chunk_b)
+                    written += len(chunk_b)
                     if written / (1024 * 1024) > MAX_FILE_MB:
                         raise RuntimeError(f"File limit {MAX_FILE_MB:.0f} MB se bada hai.")
-                    if written % (1024 * 1024 * 32) < 1024 * 512 and free_disk_mb() < MIN_FREE_DISK_MB:
+                    if written % (1024 * 1024 * 32) < 1024 * 1024 and free_disk_mb() < MIN_FREE_DISK_MB:
                         raise RuntimeError("Server ka disk bharne waala tha, download rok diya.")
-    if written < 1024:
-        raise RuntimeError("Downloaded file is empty. Link check karo.")
+        if written < 1024:
+            raise RuntimeError("Downloaded file is empty. Link check karo.")
 
 
 async def download_any(url: str, out_path: str) -> None:
@@ -337,8 +471,11 @@ async def whoami(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def disk(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     cleanup_workdir()
+    await asyncio.sleep(1.5)  # background delete ko thoda time do
     await update.message.reply_text(
-        f"Free disk: {free_disk_mb():.0f} MB (temp files clean kar diye)."
+        f"Free disk: {free_disk_mb():.0f} MB\n"
+        f"Parallel connections: {PARALLEL_CONNS}\n"
+        "Temp files turant hata diye (background me delete ho rahe hain)."
     )
 
 
