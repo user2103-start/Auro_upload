@@ -52,6 +52,7 @@ sirf optional hai (agar laptop ho to).
 |---|---|---|
 | `MAX_FILE_MB` | `2000` | isse badi file download hi nahi hogi |
 | `MIN_FREE_DISK_MB` | `300` | free space itna se kam hua to download abort |
+| `PARALLEL_CONNS` | `16` | kitne HLS segments / http chunks ek saath download karein (speed) |
 
 `/disk` command se free space dekh sakte ho aur temp files clean ho jaati hain.
 
