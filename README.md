@@ -52,9 +52,10 @@ sirf optional hai (agar laptop ho to).
 |---|---|---|
 | `MAX_FILE_MB` | `2000` | isse badi file download hi nahi hogi |
 | `MIN_FREE_DISK_MB` | `300` | free space itna se kam hua to download abort |
-| `PARALLEL_CONNS` | `16` | kitne HLS segments / http chunks ek saath download karein (speed) |
+| `PARALLEL_CONNS` | `8` | kitne HLS segments / http chunks ek saath download karein; Render free tier par 8 safe hai |
 
-`/disk` command se free space dekh sakte ho aur temp files clean ho jaati hain.
+`/disk` command se free space dekh sakte ho aur purani temp files turant clean ho jaati hain.
+Free tier par bot ek waqt me sirf ek video process karta hai, taaki 512 MB RAM limit cross na ho.
 
 
 ## Common errors
