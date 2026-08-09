@@ -46,7 +46,7 @@ import secrets
 import shutil
 import sys
 import tempfile
-import threading
+from collections import deque
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -86,8 +86,9 @@ SEND_TO_TELEGRAM = os.environ.get("SEND_TO_TELEGRAM", "1") not in ("0", "false",
 TG_MAX_MB = float(os.environ.get("TG_MAX_MB", "50"))
 MAX_FILE_MB = float(os.environ.get("MAX_FILE_MB", "2000"))
 MIN_FREE_DISK_MB = float(os.environ.get("MIN_FREE_DISK_MB", "300"))
-# how many HLS segments / http chunks to fetch in parallel (speed knob)
-PARALLEL_CONNS = int(os.environ.get("PARALLEL_CONNS", "16"))
+# 8 stays fast on CloudFront without pushing Render free tier's 512 MB RAM.
+# Users on a larger instance can raise this through the env var.
+PARALLEL_CONNS = max(1, min(int(os.environ.get("PARALLEL_CONNS", "8")), 16))
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 REDIRECT_URI = f"{PUBLIC_URL}/oauth2callback" if PUBLIC_URL else ""
@@ -100,6 +101,8 @@ URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 # chat_id per pending oauth "state" so we can DM the token back
 PENDING_AUTH: dict[str, int] = {}
 TG_APP: Application | None = None
+JOB_LOCK = asyncio.Lock()
+ACTIVE_WORKDIRS: set[str] = set()
 
 
 # --------------------------------------------------------------------------- #
@@ -111,28 +114,33 @@ def free_disk_mb(path: str | None = None) -> float:
 
 
 def cleanup_workdir() -> None:
-    """Instantly free the work dir: rename it away, delete in a background thread."""
+    """Synchronously unlink stale jobs so disk space is genuinely free on return."""
     os.makedirs(WORK_ROOT, exist_ok=True)
     try:
         entries = os.listdir(WORK_ROOT)
     except OSError:
         entries = []
-    if not entries:
-        return
-    doomed = f"{WORK_ROOT}-trash-{secrets.token_hex(4)}"
-    try:
-        os.rename(WORK_ROOT, doomed)
-        os.makedirs(WORK_ROOT, exist_ok=True)
-    except OSError:
-        doomed = WORK_ROOT
-    threading.Thread(target=shutil.rmtree, args=(doomed,), kwargs={"ignore_errors": True},
-                     daemon=True).start()
-    # aur purane trash dirs bhi saaf kar do
+    for name in entries:
+        path = os.path.join(WORK_ROOT, name)
+        if path in ACTIVE_WORKDIRS:
+            continue
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    # Old versions may have left renamed trash directories beside WORK_ROOT.
     parent = os.path.dirname(WORK_ROOT)
-    for name in os.listdir(parent):
+    try:
+        parent_entries = os.listdir(parent)
+    except OSError:
+        parent_entries = []
+    for name in parent_entries:
         if name.startswith(os.path.basename(WORK_ROOT) + "-trash-"):
-            threading.Thread(target=shutil.rmtree, args=(os.path.join(parent, name),),
-                             kwargs={"ignore_errors": True}, daemon=True).start()
+            shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -207,13 +215,23 @@ async def _watch_disk(out_path: str, proc: asyncio.subprocess.Process) -> str | 
 
 
 async def _run_downloader(cmd: list[str], out_path: str) -> tuple[int, str, str | None]:
+    # Never use communicate() here: it retains the downloader's complete output
+    # in RAM and can cross Render free tier's 512 MB limit on long videos.
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
     )
     watcher = asyncio.create_task(_watch_disk(out_path, proc))
-    _, stderr = await proc.communicate()
+    stderr_tail: deque[bytes] = deque(maxlen=40)
+    if proc.stderr is not None:
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            stderr_tail.append(line[-1024:])
+    await proc.wait()
     abort_reason = await watcher
-    return proc.returncode or 0, (stderr or b"").decode()[-1500:], abort_reason
+    stderr = b"".join(stderr_tail).decode(errors="replace")[-3000:]
+    return proc.returncode or 0, stderr, abort_reason
 
 
 def _origin(url: str) -> str:
@@ -233,6 +251,8 @@ async def download_m3u8_ytdlp(url: str, out_path: str) -> None:
         "--no-playlist",
         "--concurrent-fragments",
         str(PARALLEL_CONNS),
+        "--buffer-size",
+        "64K",
         "--retries",
         "10",
         "--fragment-retries",
@@ -471,11 +491,10 @@ async def whoami(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def disk(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     cleanup_workdir()
-    await asyncio.sleep(1.5)  # background delete ko thoda time do
     await update.message.reply_text(
         f"Free disk: {free_disk_mb():.0f} MB\n"
         f"Parallel connections: {PARALLEL_CONNS}\n"
-        "Temp files turant hata diye (background me delete ho rahe hain)."
+        "Purani temp files delete ho gayi hain. Active upload ko touch nahi kiya."
     )
 
 
@@ -590,67 +609,76 @@ async def got_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     job: Job = context.user_data["job"]
     job.title = (update.message.text or "").strip() or "Untitled"
 
-    if free_disk_mb() < MIN_FREE_DISK_MB:
-        cleanup_workdir()
-
-    msg = await update.message.reply_text("Downloading… (thoda time lagega)")
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-
-    os.makedirs(WORK_ROOT, exist_ok=True)
-    tmpdir = tempfile.mkdtemp(prefix="job-", dir=WORK_ROOT)
-    out = os.path.join(tmpdir, "video.mp4")
-    try:
-        if job.tg_file_id:
-            tg_file = await context.bot.get_file(job.tg_file_id)
-            await tg_file.download_to_drive(out)
-        else:
-            await download_any(job.url, out)
-
-        size_mb = os.path.getsize(out) / (1024 * 1024)
-        await msg.edit_text(f"Download done ({size_mb:.1f} MB). YouTube pe bhej raha hoon…")
-
-        # 1) YouTube first — ye zaroori step hai, disk jaldi khaali ho jaaye
-        video_id = await asyncio.to_thread(
-            upload_to_youtube, out, job.title, f"Source: {job.source_label or job.url}"
+    if JOB_LOCK.locked():
+        await update.message.reply_text(
+            "Abhi ek video process ho rahi hai. Uske complete hone ke baad dobara bhejna — "
+            "free Render instance par do videos saath chalengi to RAM crash ho sakti hai."
         )
-        yt_link = f"https://youtu.be/{video_id}"
-        await msg.edit_text(f"YouTube pe chala gaya ✅\n{yt_link}")
-
-        # 2) chhoti file ho to chat me bhi bhej do
-        if SEND_TO_TELEGRAM and not job.tg_file_id:
-            if size_mb <= TG_MAX_MB:
-                try:
-                    await context.bot.send_chat_action(
-                        update.effective_chat.id, ChatAction.UPLOAD_VIDEO
-                    )
-                    with open(out, "rb") as fh:
-                        await context.bot.send_video(
-                            chat_id=update.effective_chat.id,
-                            video=fh,
-                            caption=job.title[:1000],
-                            supports_streaming=True,
-                            read_timeout=600,
-                            write_timeout=600,
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("telegram send failed: %s", exc)
-                    await update.message.reply_text(
-                        f"Chat me bhej nahi paya ({exc}) — YouTube link upar hai 👆"
-                    )
-            else:
-                await update.message.reply_text(
-                    f"File {size_mb:.1f} MB hai (Telegram bot limit {TG_MAX_MB:.0f} MB), "
-                    f"isliye sirf YouTube pe gayi:\n{yt_link}"
-                )
-    except Exception as exc:  # noqa: BLE001
-        log.exception("job failed")
-        await msg.edit_text(f"Fail ho gaya ❌\n\n{exc}")
-    finally:
-        # file kabhi server pe nahi rukni chahiye
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        cleanup_workdir()
         context.user_data.pop("job", None)
-        log.info("cleanup done, free disk %.0f MB", free_disk_mb())
+        return ConversationHandler.END
+
+    async with JOB_LOCK:
+        cleanup_workdir()
+        msg = await update.message.reply_text("Downloading… (thoda time lagega)")
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+
+        os.makedirs(WORK_ROOT, exist_ok=True)
+        tmpdir = tempfile.mkdtemp(prefix="job-", dir=WORK_ROOT)
+        ACTIVE_WORKDIRS.add(tmpdir)
+        out = os.path.join(tmpdir, "video.mp4")
+        try:
+            if job.tg_file_id:
+                tg_file = await context.bot.get_file(job.tg_file_id)
+                await tg_file.download_to_drive(out)
+            else:
+                await download_any(job.url, out)
+
+            size_mb = os.path.getsize(out) / (1024 * 1024)
+            await msg.edit_text(f"Download done ({size_mb:.1f} MB). YouTube pe bhej raha hoon…")
+
+            # 1) YouTube first — ye zaroori step hai, disk jaldi khaali ho jaaye
+            video_id = await asyncio.to_thread(
+                upload_to_youtube, out, job.title, f"Source: {job.source_label or job.url}"
+            )
+            yt_link = f"https://youtu.be/{video_id}"
+            await msg.edit_text(f"YouTube pe chala gaya ✅\n{yt_link}")
+
+            # 2) chhoti file ho to chat me bhi bhej do
+            if SEND_TO_TELEGRAM and not job.tg_file_id:
+                if size_mb <= TG_MAX_MB:
+                    try:
+                        await context.bot.send_chat_action(
+                            update.effective_chat.id, ChatAction.UPLOAD_VIDEO
+                        )
+                        with open(out, "rb") as fh:
+                            await context.bot.send_video(
+                                chat_id=update.effective_chat.id,
+                                video=fh,
+                                caption=job.title[:1000],
+                                supports_streaming=True,
+                                read_timeout=600,
+                                write_timeout=600,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("telegram send failed: %s", exc)
+                        await update.message.reply_text(
+                            f"Chat me bhej nahi paya ({exc}) — YouTube link upar hai 👆"
+                        )
+                else:
+                    await update.message.reply_text(
+                        f"File {size_mb:.1f} MB hai (Telegram bot limit {TG_MAX_MB:.0f} MB), "
+                        f"isliye sirf YouTube pe gayi:\n{yt_link}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("job failed")
+            await msg.edit_text(f"Fail ho gaya ❌\n\n{exc}")
+        finally:
+            # Synchronous unlink: return hone se pehle actual disk space free ho.
+            ACTIVE_WORKDIRS.discard(tmpdir)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            cleanup_workdir()
+            context.user_data.pop("job", None)
+            log.info("cleanup done, free disk %.0f MB", free_disk_mb())
     return ConversationHandler.END
 
 
